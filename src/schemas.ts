@@ -302,6 +302,65 @@ export const DeleteSitemapSchema = z.object({
 });
 
 // ============================================================================
+// Batch Inspect Schema
+// ============================================================================
+
+export const BatchInspectSchema = GSCBaseSchema.extend({
+  urls: z
+    .array(z.string())
+    .optional()
+    .describe('List of URLs to inspect. If not provided, URLs are fetched from the sitemap automatically.'),
+  maxUrls: z
+    .number()
+    .int()
+    .min(1)
+    .max(500)
+    .default(50)
+    .describe('Maximum number of URLs to inspect (default: 50, max: 500)'),
+  languageCode: z
+    .string()
+    .default('en-US')
+    .describe('Language code for translated messages'),
+});
+
+// ============================================================================
+// Coverage Report Schema
+// ============================================================================
+
+export const CoverageReportSchema = GSCBaseSchema.extend({
+  startDate: z
+    .string()
+    .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
+    .describe('Start date in YYYY-MM-DD format'),
+  endDate: z
+    .string()
+    .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
+    .describe('End date in YYYY-MM-DD format'),
+});
+
+// ============================================================================
+// Rich Results Check Schema
+// ============================================================================
+
+export const RichResultsCheckSchema = GSCBaseSchema.extend({
+  urls: z
+    .array(z.string())
+    .optional()
+    .describe('List of URLs to check. If not provided, URLs are fetched from the sitemap automatically.'),
+  maxUrls: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .default(20)
+    .describe('Maximum number of URLs to check (default: 20, max: 100)'),
+  languageCode: z
+    .string()
+    .default('en-US')
+    .describe('Language code for translated messages'),
+});
+
+// ============================================================================
 // Type Exports
 // ============================================================================
 
@@ -314,3 +373,6 @@ export type ListSitemaps = z.infer<typeof ListSitemapsSchema>;
 export type GetSitemap = z.infer<typeof GetSitemapSchema>;
 export type SubmitSitemap = z.infer<typeof SubmitSitemapSchema>;
 export type DeleteSitemap = z.infer<typeof DeleteSitemapSchema>;
+export type BatchInspect = z.infer<typeof BatchInspectSchema>;
+export type CoverageReport = z.infer<typeof CoverageReportSchema>;
+export type RichResultsCheck = z.infer<typeof RichResultsCheckSchema>;

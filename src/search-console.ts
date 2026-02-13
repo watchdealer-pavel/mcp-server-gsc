@@ -473,4 +473,211 @@ export class SearchConsoleService {
       throw new Error(`[GSC] indexInspect failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+
+  // ==========================================================================
+  // Sitemap URL Fetching
+  // ==========================================================================
+
+  /**
+   * Fetches and parses sitemap URLs for a given site.
+   * Tries common sitemap paths and handles sitemap indexes.
+   */
+  async fetchSitemapUrls(siteUrl: string): Promise<string[]> {
+    const domain = siteUrl.startsWith('sc-domain:')
+      ? siteUrl.replace('sc-domain:', '')
+      : (() => { try { return new URL(siteUrl).hostname; } catch { return siteUrl; } })();
+
+    const sitemapPaths = [
+      `https://${domain}/sitemap.xml`,
+      `https://${domain}/sitemap_index.xml`,
+      `https://www.${domain}/sitemap.xml`,
+    ];
+
+    for (const url of sitemapPaths) {
+      try {
+        const response = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!response.ok) continue;
+        const xml = await response.text();
+
+        // Check for sitemap index
+        const sitemapIndexMatches = [...xml.matchAll(/<sitemap>\s*<loc>\s*(.*?)\s*<\/loc>/gs)];
+        if (sitemapIndexMatches.length > 0) {
+          const allUrls: string[] = [];
+          for (const match of sitemapIndexMatches) {
+            try {
+              const childResp = await fetch(match[1].trim(), {
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
+                signal: AbortSignal.timeout(15000),
+              });
+              if (!childResp.ok) continue;
+              const childXml = await childResp.text();
+              const locs = [...childXml.matchAll(/<loc>\s*(https?:\/\/[^<\s]+)\s*<\/loc>/g)];
+              allUrls.push(...locs.map(m => m[1].trim()));
+            } catch { /* skip */ }
+          }
+          if (allUrls.length > 0) return allUrls;
+        }
+
+        // Regular sitemap
+        const locs = [...xml.matchAll(/<loc>\s*(https?:\/\/[^<\s]+)\s*<\/loc>/g)];
+        if (locs.length > 0) return locs.map(m => m[1].trim());
+      } catch { /* try next */ }
+    }
+
+    return [];
+  }
+
+  // ==========================================================================
+  // Batch Inspection
+  // ==========================================================================
+
+  /**
+   * Inspects multiple URLs in batch, grouping results by verdict
+   */
+  async batchInspect(
+    siteUrl: string,
+    urls: string[] | undefined,
+    maxUrls: number,
+    languageCode: string,
+  ) {
+    let sitemapUrlCount: number | undefined;
+    if (!urls || urls.length === 0) {
+      urls = await this.fetchSitemapUrls(siteUrl);
+      sitemapUrlCount = urls.length;
+    }
+
+    const urlsToInspect = urls.slice(0, maxUrls);
+    const pass: Array<{ url: string; lastCrawlTime?: string | null }> = [];
+    const fail: Array<{
+      url: string; coverageState?: string | null; pageFetchState?: string | null;
+      robotsTxtState?: string | null; indexingState?: string | null;
+      lastCrawlTime?: string | null; googleCanonical?: string | null; userCanonical?: string | null;
+    }> = [];
+    const partial: Array<{ url: string; coverageState?: string | null; pageFetchState?: string | null; lastCrawlTime?: string | null }> = [];
+    const neutral: Array<{ url: string; coverageState?: string | null }> = [];
+    const errors: Array<{ url: string; error: string }> = [];
+
+    for (const url of urlsToInspect) {
+      try {
+        const resp = await this.indexInspect({ siteUrl, inspectionUrl: url, languageCode });
+        const idx = resp.data?.inspectionResult?.indexStatusResult;
+        const verdict = idx?.verdict ?? 'VERDICT_UNSPECIFIED';
+
+        if (verdict === 'PASS') {
+          pass.push({ url, lastCrawlTime: idx?.lastCrawlTime });
+        } else if (verdict === 'FAIL') {
+          fail.push({
+            url, coverageState: idx?.coverageState, pageFetchState: idx?.pageFetchState,
+            robotsTxtState: idx?.robotsTxtState, indexingState: idx?.indexingState,
+            lastCrawlTime: idx?.lastCrawlTime, googleCanonical: idx?.googleCanonical,
+            userCanonical: idx?.userCanonical,
+          });
+        } else if (verdict === 'PARTIAL') {
+          partial.push({ url, coverageState: idx?.coverageState, pageFetchState: idx?.pageFetchState, lastCrawlTime: idx?.lastCrawlTime });
+        } else {
+          neutral.push({ url, coverageState: idx?.coverageState });
+        }
+        await new Promise(r => setTimeout(r, 250));
+      } catch (err) {
+        errors.push({ url, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return {
+      summary: { pass: pass.length, fail: fail.length, partial: partial.length, neutral: neutral.length, errors: errors.length },
+      results: { pass, fail, partial, neutral, errors },
+      totalInspected: urlsToInspect.length,
+      ...(sitemapUrlCount !== undefined ? { sitemapUrlCount } : {}),
+    };
+  }
+
+  // ==========================================================================
+  // Coverage Report
+  // ==========================================================================
+
+  /**
+   * Cross-references sitemap URLs with search analytics to find coverage gaps
+   */
+  async coverageReport(siteUrl: string, startDate: string, endDate: string) {
+    const sitemapUrls = await this.fetchSitemapUrls(siteUrl);
+    const sitemapSet = new Set(sitemapUrls.map(u => u.replace(/\/$/, '')));
+
+    const analyticsResp = await this.searchAnalytics(siteUrl, {
+      startDate, endDate, dimensions: ['page'], rowLimit: 25000, dataState: 'final',
+    });
+
+    const rows = analyticsResp.data.rows ?? [];
+    const analyticsMap = new Map<string, { clicks: number; impressions: number; position: number }>();
+    for (const row of rows) {
+      const pageUrl = row.keys?.[0]?.replace(/\/$/, '');
+      if (pageUrl) analyticsMap.set(pageUrl, { clicks: row.clicks ?? 0, impressions: row.impressions ?? 0, position: row.position ?? 0 });
+    }
+
+    const inSitemapNoImpressions: Array<{ url: string }> = [];
+    let overlap = 0;
+    for (const url of sitemapSet) {
+      if (analyticsMap.has(url)) overlap++;
+      else inSitemapNoImpressions.push({ url });
+    }
+
+    const hasImpressionsNoSitemap: Array<{ url: string; clicks: number; impressions: number; position: number }> = [];
+    for (const [url, data] of analyticsMap) {
+      if (!sitemapSet.has(url)) hasImpressionsNoSitemap.push({ url, ...data });
+    }
+    hasImpressionsNoSitemap.sort((a, b) => b.impressions - a.impressions);
+
+    return {
+      sitemapUrls: sitemapSet.size,
+      analyticsUrls: analyticsMap.size,
+      inSitemapNoImpressions: inSitemapNoImpressions.slice(0, 100),
+      hasImpressionsNoSitemap: hasImpressionsNoSitemap.slice(0, 100),
+      overlap,
+      coveragePercent: sitemapSet.size > 0 ? Number(((overlap / sitemapSet.size) * 100).toFixed(1)) : 0,
+    };
+  }
+
+  // ==========================================================================
+  // Rich Results Check
+  // ==========================================================================
+
+  /**
+   * Inspects URLs and extracts rich results data and issues
+   */
+  async richResultsCheck(siteUrl: string, urls: string[] | undefined, maxUrls: number, languageCode: string) {
+    if (!urls || urls.length === 0) urls = await this.fetchSitemapUrls(siteUrl);
+    const urlsToCheck = urls.slice(0, maxUrls);
+
+    const results: Array<{
+      url: string;
+      verdict?: string | null;
+      detectedItems: Array<{ type: string; items: Array<{ name?: string | null; issues?: Array<{ issueMessage?: string | null; severity?: string | null }> }> }>;
+    }> = [];
+    const issuesSummary: Record<string, number> = {};
+
+    for (const url of urlsToCheck) {
+      try {
+        const resp = await this.indexInspect({ siteUrl, inspectionUrl: url, languageCode });
+        const rich = resp.data?.inspectionResult?.richResultsResult;
+        if (rich?.detectedItems && rich.detectedItems.length > 0) {
+          const detectedItems = rich.detectedItems.map(di => ({
+            type: di.richResultType ?? 'unknown',
+            items: (di.items ?? []).map(item => {
+              const issues = (item.issues ?? []).map(issue => {
+                if (issue.issueMessage) issuesSummary[issue.issueMessage] = (issuesSummary[issue.issueMessage] ?? 0) + 1;
+                return { issueMessage: issue.issueMessage, severity: issue.severity };
+              });
+              return { name: item.name, ...(issues.length > 0 ? { issues } : {}) };
+            }),
+          }));
+          results.push({ url, verdict: rich.verdict, detectedItems });
+        }
+        await new Promise(r => setTimeout(r, 250));
+      } catch { /* skip */ }
+    }
+
+    return { totalChecked: urlsToCheck.length, urlsWithRichResults: results.length, results, issuesSummary };
+  }
 }

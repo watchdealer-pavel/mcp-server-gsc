@@ -6,12 +6,15 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { z } from 'zod';
 
 import {
+  BatchInspectSchema,
+  CoverageReportSchema,
   DeleteSitemapSchema,
   EnhancedSearchAnalyticsSchema,
   GetSitemapSchema,
   IndexInspectSchema,
   ListSitemapsSchema,
   QuickWinsDetectionSchema,
+  RichResultsCheckSchema,
   SearchAnalyticsSchema,
   SubmitSitemapSchema,
   type SearchAnalytics,
@@ -188,6 +191,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Delete a sitemap from Google Search Console',
         inputSchema: z.toJSONSchema(DeleteSitemapSchema),
       },
+      {
+        name: 'batch_inspect',
+        description: 'Inspect multiple URLs in batch, grouping results by indexing verdict (PASS/FAIL/PARTIAL). Fetches URLs from sitemap if not provided.',
+        inputSchema: z.toJSONSchema(BatchInspectSchema),
+      },
+      {
+        name: 'coverage_report',
+        description: 'Cross-reference sitemap URLs with search analytics to find unindexed pages and orphaned URLs not in sitemap',
+        inputSchema: z.toJSONSchema(CoverageReportSchema),
+      },
+      {
+        name: 'rich_results_check',
+        description: 'Inspect URLs for rich results (structured data) issues and detected item types',
+        inputSchema: z.toJSONSchema(RichResultsCheckSchema),
+      },
     ],
   };
 });
@@ -343,6 +361,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           message: `Sitemap ${parsed.feedpath} deleted successfully`,
           data: response.data,
         });
+      }
+
+      // --------------------------------------------------------------------
+      // Batch Inspect
+      // --------------------------------------------------------------------
+      case 'batch_inspect': {
+        const parsed = BatchInspectSchema.parse(args);
+        const response = await searchConsoleService.batchInspect(
+          parsed.siteUrl,
+          parsed.urls,
+          parsed.maxUrls,
+          parsed.languageCode,
+        );
+        return formatResponse(response);
+      }
+
+      // --------------------------------------------------------------------
+      // Coverage Report
+      // --------------------------------------------------------------------
+      case 'coverage_report': {
+        const parsed = CoverageReportSchema.parse(args);
+        const response = await searchConsoleService.coverageReport(
+          parsed.siteUrl,
+          parsed.startDate,
+          parsed.endDate,
+        );
+        return formatResponse(response);
+      }
+
+      // --------------------------------------------------------------------
+      // Rich Results Check
+      // --------------------------------------------------------------------
+      case 'rich_results_check': {
+        const parsed = RichResultsCheckSchema.parse(args);
+        const response = await searchConsoleService.richResultsCheck(
+          parsed.siteUrl,
+          parsed.urls,
+          parsed.maxUrls,
+          parsed.languageCode,
+        );
+        return formatResponse(response);
       }
 
       // --------------------------------------------------------------------
