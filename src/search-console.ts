@@ -1,6 +1,8 @@
 import { google, searchconsole_v1, webmasters_v3 } from 'googleapis';
 import { GoogleAuth, AuthClient } from 'google-auth-library';
 import { QuickWinsThresholds } from './schemas.js';
+import { validateDateRange, validateSiteUrl, validateRegex, validateArrayLength, parseGoogleApiError } from './validators.js';
+import { QuotaTracker } from './quota-tracker.js';
 
 // ============================================================================
 // Types
@@ -84,6 +86,7 @@ export class SearchConsoleService {
   private auth: GoogleAuth;
   private cachedAuthClient: AuthClient | null = null;
   private readonly hasWriteAccess: boolean;
+  private quotaTracker: QuotaTracker;
 
   /**
    * Creates a new SearchConsoleService instance
@@ -93,6 +96,7 @@ export class SearchConsoleService {
    */
   constructor(credentials: string, writeAccess: boolean = true) {
     this.hasWriteAccess = writeAccess;
+    this.quotaTracker = new QuotaTracker();
 
     // Use full scope if write access is needed, otherwise readonly
     // @see https://developers.google.com/webmaster-tools/v1/how-tos/authorizing
@@ -189,16 +193,32 @@ export class SearchConsoleService {
    * @see https://developers.google.com/webmaster-tools/v1/searchanalytics/query
    */
   async searchAnalytics(siteUrl: string, requestBody: SearchAnalyticsQueryRequest) {
+    // Validate inputs
+    validateSiteUrl(siteUrl);
+    if (requestBody?.startDate && requestBody?.endDate) {
+      validateDateRange(requestBody.startDate, requestBody.endDate);
+    }
+    
+    // Track quota and warn if approaching limit
+    const quotaWarning = this.quotaTracker.recordSearchAnalytics();
+    if (quotaWarning) {
+      console.error(quotaWarning);
+    }
+    
     const webmasters = await this.getWebmasters();
 
-    return this.withPermissionFallback(
-      () => webmasters.searchanalytics.query({ siteUrl, requestBody }),
-      () => webmasters.searchanalytics.query({
-        siteUrl: this.normalizeUrl(siteUrl),
-        requestBody
-      }),
-      'searchAnalytics',
-    );
+    try {
+      return await this.withPermissionFallback(
+        () => webmasters.searchanalytics.query({ siteUrl, requestBody }),
+        () => webmasters.searchanalytics.query({
+          siteUrl: this.normalizeUrl(siteUrl),
+          requestBody
+        }),
+        'searchAnalytics',
+      );
+    } catch (err) {
+      throw parseGoogleApiError(err);
+    }
   }
 
   /**
@@ -216,6 +236,19 @@ export class SearchConsoleService {
   ): Promise<{ data: EnhancedSearchAnalyticsResponse }> {
     if (!requestBody) {
       throw new Error('Request body is required');
+    }
+
+    // Validate regex if provided
+    if (options.regexFilter) {
+      validateRegex(options.regexFilter);
+    }
+    
+    // Warn about large rowLimit values
+    if (requestBody.rowLimit && requestBody.rowLimit > 10000) {
+      console.error(
+        `⚠️  Large rowLimit (${requestBody.rowLimit}). This may take longer and consume more quota. ` +
+        `Consider pagination with startRow for very large datasets.`
+      );
     }
 
     // Clone request body to avoid mutation
@@ -465,12 +498,23 @@ export class SearchConsoleService {
    * @see https://developers.google.com/webmaster-tools/v1/urlInspection.index/inspect
    */
   async indexInspect(requestBody: IndexInspectRequest) {
+    // Validate inputs
+    if (requestBody?.siteUrl) {
+      validateSiteUrl(requestBody.siteUrl);
+    }
+    
+    // Track quota
+    const quotaWarning = this.quotaTracker.recordUrlInspection();
+    if (quotaWarning) {
+      console.error(quotaWarning);
+    }
+    
     const searchConsole = await this.getSearchConsole();
 
     try {
       return await searchConsole.urlInspection.index.inspect({ requestBody });
     } catch (err) {
-      throw new Error(`[GSC] indexInspect failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw parseGoogleApiError(err);
     }
   }
 
@@ -543,6 +587,12 @@ export class SearchConsoleService {
     maxUrls: number,
     languageCode: string,
   ) {
+    // Validate inputs
+    validateSiteUrl(siteUrl);
+    if (urls) {
+      validateArrayLength(urls, 500, 'urls');
+    }
+    
     let sitemapUrlCount: number | undefined;
     if (!urls || urls.length === 0) {
       urls = await this.fetchSitemapUrls(siteUrl);
@@ -580,7 +630,10 @@ export class SearchConsoleService {
         } else {
           neutral.push({ url, coverageState: idx?.coverageState });
         }
-        await new Promise(r => setTimeout(r, 250));
+        
+        // Use adaptive delay based on quota tracker
+        const delay = this.quotaTracker.getRecommendedInspectionDelay();
+        await new Promise(r => setTimeout(r, delay));
       } catch (err) {
         errors.push({ url, error: err instanceof Error ? err.message : String(err) });
       }
@@ -602,6 +655,10 @@ export class SearchConsoleService {
    * Cross-references sitemap URLs with search analytics to find coverage gaps
    */
   async coverageReport(siteUrl: string, startDate: string, endDate: string) {
+    // Validate inputs
+    validateSiteUrl(siteUrl);
+    validateDateRange(startDate, endDate);
+    
     const sitemapUrls = await this.fetchSitemapUrls(siteUrl);
     const sitemapSet = new Set(sitemapUrls.map(u => u.replace(/\/$/, '')));
 
@@ -647,6 +704,12 @@ export class SearchConsoleService {
    * Inspects URLs and extracts rich results data and issues
    */
   async richResultsCheck(siteUrl: string, urls: string[] | undefined, maxUrls: number, languageCode: string) {
+    // Validate inputs
+    validateSiteUrl(siteUrl);
+    if (urls) {
+      validateArrayLength(urls, 500, 'urls');
+    }
+    
     if (!urls || urls.length === 0) urls = await this.fetchSitemapUrls(siteUrl);
     const urlsToCheck = urls.slice(0, maxUrls);
 
@@ -674,7 +737,9 @@ export class SearchConsoleService {
           }));
           results.push({ url, verdict: rich.verdict, detectedItems });
         }
-        await new Promise(r => setTimeout(r, 250));
+        // Use adaptive delay based on quota tracker
+        const delay = this.quotaTracker.getRecommendedInspectionDelay();
+        await new Promise(r => setTimeout(r, delay));
       } catch { /* skip */ }
     }
 

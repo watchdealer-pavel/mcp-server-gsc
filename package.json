@@ -17,14 +17,14 @@
     "watch": "tsc --watch"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
     "@google-cloud/local-auth": "^3.0.1",
-    "@modelcontextprotocol/sdk": "^1.25.1",
-    "google-auth-library": "^10.5.0",
-    "googleapis": "^169.0.0",
-    "zod": "^4.2.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "google-auth-library": "^10.6.2",
+    "googleapis": "^171.4.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^24.10.4",

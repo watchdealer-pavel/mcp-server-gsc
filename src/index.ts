@@ -4,6 +4,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { sanitizeForLogging } from './validators.js';
 
 import {
   BatchInspectSchema,
@@ -132,9 +133,8 @@ const server = new Server(
   },
   {
     capabilities: {
-      resources: {},
       tools: {},
-      prompts: {},
+      logging: {},
     },
   },
 );
@@ -411,8 +411,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${toolName}`);
     }
   } catch (error) {
-    // Log error for debugging
-    console.error(`[${toolName}] Error:`, error);
+    // Sanitize error message before logging
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const sanitized = sanitizeForLogging(errorMessage);
+    
+    // Send to MCP logging channel
+    await server.sendLoggingMessage({
+      level: 'error',
+      data: `[${toolName}] ${sanitized}`,
+    });
 
     // Handle Zod validation errors with detailed messages
     if (error instanceof z.ZodError) {
@@ -420,10 +427,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const path = issue.path.length > 0 ? issue.path.join('.') : 'input';
         return `${path}: ${issue.message}`;
       });
-      throw new Error(`Invalid arguments: ${issues.join('; ')}`);
+      throw new Error(`Invalid arguments for ${toolName}: ${issues.join('; ')}`);
     }
 
-    // Re-throw other errors
+    // Re-throw other errors (already sanitized)
+    if (error instanceof Error) {
+      error.message = sanitized;
+    }
     throw error;
   }
 });

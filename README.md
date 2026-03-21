@@ -1,154 +1,205 @@
-# Google Search Console MCP Server
+# mcp-server-gsc
 
-A Model Context Protocol (MCP) server providing comprehensive access to Google Search Console data with enhanced analytics capabilities.
+Google Search Console MCP server — query analytics, detect quick wins, inspect URLs, manage sitemaps.
 
 ## Features
 
-- **Enhanced Search Analytics**: Retrieve up to 25,000 rows of performance data
-- **Advanced Filtering**: Support for regex patterns and multiple filter operators
-- **Quick Wins Detection**: Automatically identify optimization opportunities
-- **Rich Dimensions**: Query, page, country, device, and search appearance analysis
-- **Flexible Date Ranges**: Customizable reporting periods with historical data access
+- **Search Analytics**: Query clicks, impressions, CTR, position data (up to 25K rows)
+- **Quick Wins Detection**: Find high-impression, low-CTR keywords ready for optimization
+- **URL Inspection**: Check indexing status, rich results, crawl info
+- **Batch Operations**: Inspect multiple URLs, cross-reference sitemap vs analytics
+- **Sitemap Management**: List, submit, delete sitemaps
+- **Smart Throttling**: Auto-adapts to API rate limits, tracks quota usage
 
-## Prerequisites
+Originally based on [ahonn/mcp-server-gsc](https://github.com/ahonn/mcp-server-gsc).
 
-- Node.js 18 or later
-- Google Cloud Project with Search Console API enabled
-- Service Account credentials with Search Console access
+## Install
 
-## Installation
+### For Claude Desktop
 
 ```bash
-npm install mcp-server-gsc
+npm install -g mcp-server-gsc
 ```
 
-## Authentication Setup
-
-To obtain Google Search Console API credentials:
-
-1. Visit the [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select an existing one
-3. Enable the API:
-
-- Go to "APIs & Services" > "Library"
-- Search for and enable ["Search Console API"](https://console.cloud.google.com/marketplace/product/google/searchconsole.googleapis.com)
-
-4. Create credentials:
-
-- Navigate to ["APIs & Services" > "Credentials"](https://console.cloud.google.com/apis/credentials)
-- Click "Create Credentials" > "Service Account"
-- Fill in the service account details
-- Create a new key in JSON format
-- The credentials file (.json) will download automatically
-
-5. Grant access:
-
-- Open Search Console
-- Add the service account email (format: name@project.iam.gserviceaccount.com) as a property administrator
-
-## Usage
-
-### Claude Desktop Configuration
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "gsc": {
-      "command": "npx",
-      "args": ["-y", "mcp-server-gsc"],
+      "command": "mcp-server-gsc",
       "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/credentials.json"
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your-service-account-key.json"
       }
     }
   }
 }
 ```
 
-## Available Tools
+### For other MCP clients
 
-### search_analytics
+Install as a dev dependency or globally, then configure your MCP client to run:
 
-Get comprehensive search performance data from Google Search Console with enhanced analytics capabilities.
-
-**Required Parameters:**
-
-- `siteUrl`: Site URL (format: `http://www.example.com/` or `sc-domain:example.com`)
-- `startDate`: Start date (YYYY-MM-DD)
-- `endDate`: End date (YYYY-MM-DD)
-
-**Optional Parameters:**
-
-- `dimensions`: Comma-separated list (`query`, `page`, `country`, `device`, `searchAppearance`, `date`)
-- `type`: Search type (`web`, `image`, `video`, `news`, `discover`, `googleNews`)
-- `aggregationType`: Aggregation method (`auto`, `byNewsShowcasePanel`, `byProperty`, `byPage`)
-- `rowLimit`: Maximum rows to return (default: 1000, max: 25000)
-- `dataState`: Data freshness (`all` or `final`, default: `final`)
-
-**Filter Parameters:**
-
-- `pageFilter`: Filter by page URL (supports regex with `regex:` prefix)
-- `queryFilter`: Filter by search query (supports regex with `regex:` prefix)
-- `countryFilter`: Filter by country ISO 3166-1 alpha-3 code (e.g., `USA`, `CHN`)
-- `deviceFilter`: Filter by device type (`DESKTOP`, `MOBILE`, `TABLET`)
-- `searchAppearanceFilter`: Filter by search feature (e.g., `AMP_BLUE_LINK`, `AMP_TOP_STORIES`)
-- `filterOperator`: Operator for filters (`equals`, `contains`, `notEquals`, `notContains`, `includingRegex`, `excludingRegex`)
-
-**Quick Wins Detection:**
-
-- `detectQuickWins`: Enable automatic detection of optimization opportunities (default: `false`)
-- `quickWinsConfig`: Configuration for quick wins detection:
-  - `positionRange`: Position range to consider (default: `[4, 20]`)
-  - `minImpressions`: Minimum impressions threshold (default: `100`)
-  - `minCtr`: Minimum CTR percentage (default: `1`)
-
-**Example - Basic Query:**
-
-```json
-{
-  "siteUrl": "https://example.com",
-  "startDate": "2024-01-01",
-  "endDate": "2024-01-31",
-  "dimensions": "query,page",
-  "rowLimit": 5000
-}
+```bash
+mcp-server-gsc
 ```
 
-**Example - Advanced Filtering with Regex:**
+with `GOOGLE_APPLICATION_CREDENTIALS` set to your service account JSON path.
 
-```json
-{
-  "siteUrl": "https://example.com",
-  "startDate": "2024-01-01",
-  "endDate": "2024-01-31",
-  "dimensions": "page,query",
-  "queryFilter": "regex:(AI|machine learning|ML)",
-  "filterOperator": "includingRegex",
-  "deviceFilter": "MOBILE",
-  "rowLimit": 10000
-}
+## Authentication
+
+You need a Google Cloud service account with Search Console access.
+
+### Step 1: Create a service account
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create or select a project
+3. Navigate to **APIs & Services** → **Credentials**
+4. Click **Create Credentials** → **Service Account**
+5. Fill in details, create a **JSON key**, download it
+
+### Step 2: Enable Search Console API
+
+1. Go to [APIs & Services → Library](https://console.cloud.google.com/apis/library)
+2. Search for **"Search Console API"**
+3. Click **Enable**
+
+### Step 3: Grant access in Search Console
+
+1. Open [Google Search Console](https://search.google.com/search-console)
+2. Select your property
+3. Go to **Settings** → **Users and permissions**
+4. Add the service account email (looks like `name@project-id.iam.gserviceaccount.com`) as **Owner**
+
+### Step 4: Set environment variable
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your-key.json"
 ```
 
-**Example - Quick Wins Detection:**
+Or add to your MCP client config (see Install section above).
 
-```json
-{
-  "siteUrl": "https://example.com",
-  "startDate": "2024-01-01",
-  "endDate": "2024-01-31",
-  "dimensions": "query,page",
-  "detectQuickWins": true,
-  "quickWinsConfig": {
-    "positionRange": [4, 15],
-    "minImpressions": 500,
-    "minCtr": 2
-  }
-}
+## Tools
+
+| Tool | Purpose |
+|------|---------|
+| `list_sites` | List all GSC properties you have access to |
+| `search_analytics` | Query search performance (clicks, impressions, CTR, position) |
+| `enhanced_search_analytics` | Advanced query with regex filters and quick wins detection |
+| `detect_quick_wins` | Find SEO quick wins (high impressions, low CTR, positions 4-10) |
+| `index_inspect` | Check indexing status of a URL |
+| `batch_inspect` | Inspect multiple URLs, group by verdict (PASS/FAIL/PARTIAL) |
+| `coverage_report` | Cross-reference sitemap URLs vs search analytics to find gaps |
+| `rich_results_check` | Inspect URLs for structured data / rich results |
+| `list_sitemaps` | List submitted sitemaps |
+| `get_sitemap` | Get details for a specific sitemap |
+| `submit_sitemap` | Submit a new sitemap |
+| `delete_sitemap` | Remove a sitemap |
+
+## Example Workflows
+
+### Find Quick Wins
+
 ```
+1. List sites:
+   Tool: list_sites
+
+2. Detect opportunities:
+   Tool: detect_quick_wins
+   siteUrl: "sc-domain:example.com"
+   startDate: "2026-01-01"
+   endDate: "2026-03-31"
+   minImpressions: 100
+   maxCtr: 2.0
+
+3. Inspect top URLs:
+   Tool: index_inspect
+   siteUrl: "sc-domain:example.com"
+   inspectionUrl: "https://example.com/page-to-optimize"
+```
+
+### Coverage Audit
+
+```
+Tool: coverage_report
+siteUrl: "sc-domain:example.com"
+startDate: "2026-01-01"
+endDate: "2026-03-31"
+
+Returns:
+- Pages in sitemap with no impressions
+- Pages with impressions not in sitemap (orphaned)
+- Coverage percentage
+```
+
+### Query Analytics with Filters
+
+```
+Tool: search_analytics
+siteUrl: "https://www.example.com/"
+startDate: "2026-01-01"
+endDate: "2026-01-31"
+dimensions: "query,page"
+queryFilter: "watches"
+filterOperator: "contains"
+deviceFilter: "MOBILE"
+rowLimit: 5000
+```
+
+## Tips
+
+**siteUrl format:**
+- Domain properties: `sc-domain:example.com`
+- URL-prefix properties: `https://www.example.com/`
+
+Use `list_sites` to see exact format.
+
+**Data freshness:**
+- GSC data has ~2-3 day lag
+- Use `dataState: "final"` for stable data (default)
+- Use `dataState: "all"` to include fresh unfinalized data
+
+**Row limits:**
+- Default: 1,000 rows
+- Max: 25,000 rows
+- For larger datasets, paginate with `startRow`
+
+**Quota limits:**
+- Search Analytics: ~1,200 requests/day
+- URL Inspection: ~600 requests/minute
+- Server warns at 80% usage and auto-throttles batch operations
+
+**Date ranges:**
+- Max: 16 months per GSC API limits
+- Format: `YYYY-MM-DD`
+
+## Troubleshooting
+
+**"Permission denied"**
+
+Make sure:
+1. Service account email is added as **Owner** in Search Console
+2. Search Console API is **enabled** in Google Cloud
+3. `siteUrl` exactly matches a property from `list_sites`
+
+**"Quota exceeded"**
+
+Wait 24 hours for quota reset or reduce batch sizes. Check [Google Search Console API quotas](https://developers.google.com/webmaster-tools/v1/limits).
+
+**"Invalid siteUrl"**
+
+Use exact format from `list_sites`. Common mistake: `sc-domain:example.com` (correct) vs `example.com` (incorrect).
+
+**"Date range exceeds 16 months"**
+
+GSC API supports max 16 months of data. Break into multiple queries.
+
+## Credits
+
+Built on the Google Search Console API.
+
+Originally created by [ahonn](https://github.com/ahonn). Enhanced version maintained by [watchdealer-pavel](https://github.com/watchdealer-pavel).
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions are welcome! Please read our contributing guidelines before submitting pull requests.

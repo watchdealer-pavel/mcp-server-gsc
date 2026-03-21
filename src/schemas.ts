@@ -125,14 +125,14 @@ export const SearchAnalyticsSchema = GSCBaseSchema.extend({
     .optional()
     .describe('How to aggregate results'),
   rowLimit: z
-    .number()
+    .coerce.number()
     .int()
     .min(1)
     .max(25000)
     .default(1000)
     .describe('Maximum rows to return (1-25,000, default: 1,000)'),
   startRow: z
-    .number()
+    .coerce.number()
     .int()
     .min(0)
     .default(0)
@@ -170,42 +170,42 @@ export const SearchAnalyticsSchema = GSCBaseSchema.extend({
 
 export const QuickWinsThresholdsSchema = z.object({
   minImpressions: z
-    .number()
+    .coerce.number()
     .int()
     .min(1)
     .default(50)
     .describe('Minimum impressions threshold'),
   maxCtr: z
-    .number()
+    .coerce.number()
     .min(0)
     .max(100)
     .default(2.0)
     .describe('Maximum CTR percentage (0-100)'),
   positionRangeMin: z
-    .number()
+    .coerce.number()
     .min(1)
     .max(100)
     .default(4)
     .describe('Minimum position (1-100)'),
   positionRangeMax: z
-    .number()
+    .coerce.number()
     .min(1)
     .max(100)
     .default(10)
     .describe('Maximum position (1-100)'),
   targetCtr: z
-    .number()
+    .coerce.number()
     .min(0)
     .max(100)
     .default(5.0)
     .describe('Target CTR percentage for potential calculation'),
   estimatedClickValue: z
-    .number()
+    .coerce.number()
     .min(0)
     .default(1.0)
     .describe('Estimated value per click ($)'),
   conversionRate: z
-    .number()
+    .coerce.number()
     .min(0)
     .max(1)
     .default(0.03)
@@ -311,7 +311,7 @@ export const BatchInspectSchema = GSCBaseSchema.extend({
     .optional()
     .describe('List of URLs to inspect. If not provided, URLs are fetched from the sitemap automatically.'),
   maxUrls: z
-    .number()
+    .coerce.number()
     .int()
     .min(1)
     .max(500)
@@ -348,7 +348,7 @@ export const RichResultsCheckSchema = GSCBaseSchema.extend({
     .optional()
     .describe('List of URLs to check. If not provided, URLs are fetched from the sitemap automatically.'),
   maxUrls: z
-    .number()
+    .coerce.number()
     .int()
     .min(1)
     .max(100)
