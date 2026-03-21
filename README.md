@@ -38,17 +38,13 @@ Built-in input validation (date ranges, siteUrl format, 16-month limit), quota t
 ## Install
 
 ```bash
-npm install -g mcp-server-gsc
-```
-
-Or clone and build from source:
-
-```bash
 git clone https://github.com/watchdealer-pavel/mcp-server-gsc.git
 cd mcp-server-gsc
 npm install
 npm run build
 ```
+
+This gives you the binary at `./dist/index.js`. Point your MCP client at it with `node /path/to/mcp-server-gsc/dist/index.js`.
 
 ---
 
@@ -79,7 +75,8 @@ Add to `~/.openclaw/config/openclaw.json` under `mcpServers`:
 ```json
 {
   "gsc": {
-    "command": "mcp-server-gsc",
+    "command": "node",
+    "args": ["/path/to/mcp-server-gsc/dist/index.js"],
     "env": {
       "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/credentials.json"
     }
@@ -87,33 +84,16 @@ Add to `~/.openclaw/config/openclaw.json` under `mcpServers`:
 }
 ```
 
-<details>
-<summary><strong>Copy-paste for OpenClaw agent setup</strong></summary>
-
-Paste this into your agent chat:
-
-```
-Install and configure mcp-server-gsc for Google Search Console access.
-
-1. Run: npm install -g mcp-server-gsc
-2. Add to MCP config:
-   - server name: "gsc"
-   - command: "mcp-server-gsc"
-   - env GOOGLE_APPLICATION_CREDENTIALS pointing to the service account JSON
-3. Test with: mcporter call gsc.list_sites
-```
-
-</details>
-
 #### Claude Code
 
-Add to your MCP settings (`.mcp.json` or via Settings → MCP Servers):
+Add to `.mcp.json` or via Settings → MCP Servers:
 
 ```json
 {
   "mcpServers": {
     "gsc": {
-      "command": "mcp-server-gsc",
+      "command": "node",
+      "args": ["/path/to/mcp-server-gsc/dist/index.js"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/credentials.json"
       }
@@ -122,36 +102,9 @@ Add to your MCP settings (`.mcp.json` or via Settings → MCP Servers):
 }
 ```
 
-<details>
-<summary><strong>Copy-paste for Claude Code setup</strong></summary>
-
-Paste this into Claude Code:
-
-```
-Add mcp-server-gsc to my MCP configuration.
-
-Install: npm install -g mcp-server-gsc
-
-Config for .mcp.json:
-{
-  "mcpServers": {
-    "gsc": {
-      "command": "mcp-server-gsc",
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/absolute/path/to/credentials.json"
-      }
-    }
-  }
-}
-
-After adding, verify by calling the list_sites tool.
-```
-
-</details>
-
 #### Cursor / Windsurf / Other MCP clients
 
-Same pattern — point your MCP client at the `mcp-server-gsc` command with `GOOGLE_APPLICATION_CREDENTIALS` set. If building from source, point to `node /path/to/mcp-server-gsc/dist/index.js` instead.
+Same pattern — point at `node /path/to/mcp-server-gsc/dist/index.js` with `GOOGLE_APPLICATION_CREDENTIALS` set.
 
 ---
 
