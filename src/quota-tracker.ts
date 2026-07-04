@@ -1,151 +1,154 @@
 /**
- * Simple quota tracker for Google Search Console API
- * 
- * GSC API limits (approximate):
- * - searchanalytics.query: ~1,200 requests per day
- * - urlInspection.index.inspect: ~600 requests per minute
- * 
- * This tracker warns when approaching limits but doesn't enforce them
- * (enforcement is handled by the API itself).
+ * Simple quota tracker for the Google Search Console API.
+ *
+ * Official per-site limits (https://developers.google.com/webmaster-tools/limits):
+ * - Search Analytics (searchanalytics.query): 1,200 QPM per site (per-MINUTE)
+ * - URL Inspection (urlInspection.index.inspect): 600 QPM AND 2,000 QPD per site
+ *
+ * This tracker warns as we approach these limits; it does not enforce them
+ * (the API enforces its own quotas). Counts are per-process and best-effort —
+ * per-site/user/project accounting server-side may differ.
  */
 
 interface QuotaState {
-  searchAnalyticsCount: number;
-  urlInspectionCount: number;
-  lastResetDate: string;
-  lastInspectionMinute: string;
+  // Search Analytics — per-minute (1,200 QPM/site)
+  saMinute: string;
+  saCountThisMinute: number;
+  // URL Inspection — per-minute (600 QPM/site) + per-day (2,000 QPD/site)
+  inspectionMinute: string;
   inspectionCountThisMinute: number;
+  inspectionDay: string;
+  inspectionCountToday: number;
 }
 
 export class QuotaTracker {
   private state: QuotaState;
-  
-  // Estimated daily limits (conservative)
-  private readonly SEARCH_ANALYTICS_DAILY_LIMIT = 1200;
+
+  // Official per-site limits.
+  private readonly SEARCH_ANALYTICS_PER_MINUTE_LIMIT = 1200;
   private readonly URL_INSPECTION_PER_MINUTE_LIMIT = 600;
-  
+  private readonly URL_INSPECTION_PER_DAY_LIMIT = 2000;
+
   constructor() {
-    const today = new Date().toISOString().split('T')[0];
     this.state = {
-      searchAnalyticsCount: 0,
-      urlInspectionCount: 0,
-      lastResetDate: today,
-      lastInspectionMinute: this.getCurrentMinute(),
+      saMinute: this.currentMinute(),
+      saCountThisMinute: 0,
+      inspectionMinute: this.currentMinute(),
       inspectionCountThisMinute: 0,
+      inspectionDay: this.currentDay(),
+      inspectionCountToday: 0,
     };
   }
-  
-  /**
-   * Gets current minute in format YYYY-MM-DDTHH:MM
-   */
-  private getCurrentMinute(): string {
-    const now = new Date();
-    return now.toISOString().substring(0, 16); // YYYY-MM-DDTHH:MM
+
+  /** Current minute bucket, format YYYY-MM-DDTHH:MM */
+  private currentMinute(): string {
+    return new Date().toISOString().substring(0, 16);
   }
-  
-  /**
-   * Resets daily counters if it's a new day
-   */
-  private maybeResetDaily(): void {
-    const today = new Date().toISOString().split('T')[0];
-    if (today !== this.state.lastResetDate) {
-      this.state.searchAnalyticsCount = 0;
-      this.state.urlInspectionCount = 0;
-      this.state.lastResetDate = today;
+
+  /** Current day bucket, format YYYY-MM-DD */
+  private currentDay(): string {
+    return new Date().toISOString().substring(0, 10);
+  }
+
+  private rollSearchAnalytics(): void {
+    const minute = this.currentMinute();
+    if (minute !== this.state.saMinute) {
+      this.state.saMinute = minute;
+      this.state.saCountThisMinute = 0;
     }
   }
-  
-  /**
-   * Resets per-minute counter if it's a new minute
-   */
-  private maybeResetMinute(): void {
-    const currentMinute = this.getCurrentMinute();
-    if (currentMinute !== this.state.lastInspectionMinute) {
+
+  private rollInspection(): void {
+    const minute = this.currentMinute();
+    if (minute !== this.state.inspectionMinute) {
+      this.state.inspectionMinute = minute;
       this.state.inspectionCountThisMinute = 0;
-      this.state.lastInspectionMinute = currentMinute;
+    }
+    const day = this.currentDay();
+    if (day !== this.state.inspectionDay) {
+      this.state.inspectionDay = day;
+      this.state.inspectionCountToday = 0;
     }
   }
-  
+
   /**
-   * Records a search analytics API call
-   * @returns Warning message if approaching limit, null otherwise
+   * Records a Search Analytics API call.
+   * @returns Warning message if approaching the per-minute limit, null otherwise.
    */
   recordSearchAnalytics(): string | null {
-    this.maybeResetDaily();
-    this.state.searchAnalyticsCount++;
-    
-    const percentUsed = (this.state.searchAnalyticsCount / this.SEARCH_ANALYTICS_DAILY_LIMIT) * 100;
-    
-    if (percentUsed >= 90) {
-      return `⚠️  Search Analytics quota at ${percentUsed.toFixed(0)}% (${this.state.searchAnalyticsCount}/${this.SEARCH_ANALYTICS_DAILY_LIMIT} today). Approaching daily limit.`;
-    } else if (percentUsed >= 80) {
-      return `⚠️  Search Analytics quota at ${percentUsed.toFixed(0)}% (${this.state.searchAnalyticsCount}/${this.SEARCH_ANALYTICS_DAILY_LIMIT} today).`;
+    this.rollSearchAnalytics();
+    this.state.saCountThisMinute++;
+
+    const pct = (this.state.saCountThisMinute / this.SEARCH_ANALYTICS_PER_MINUTE_LIMIT) * 100;
+    if (pct >= 80) {
+      return `⚠️  Search Analytics quota at ${pct.toFixed(0)}% this minute ` +
+        `(${this.state.saCountThisMinute}/${this.SEARCH_ANALYTICS_PER_MINUTE_LIMIT} QPM per site).`;
     }
-    
     return null;
   }
-  
+
   /**
-   * Records a URL inspection API call
-   * @returns Warning message if approaching limit, null otherwise
+   * Records a URL Inspection API call.
+   * @returns Warning message if approaching the per-minute or per-day limit, null otherwise.
    */
   recordUrlInspection(): string | null {
-    this.maybeResetDaily();
-    this.maybeResetMinute();
-    
-    this.state.urlInspectionCount++;
+    this.rollInspection();
     this.state.inspectionCountThisMinute++;
-    
-    const percentUsedMinute = (this.state.inspectionCountThisMinute / this.URL_INSPECTION_PER_MINUTE_LIMIT) * 100;
-    
-    if (percentUsedMinute >= 80) {
-      return `⚠️  URL Inspection quota at ${percentUsedMinute.toFixed(0)}% this minute (${this.state.inspectionCountThisMinute}/${this.URL_INSPECTION_PER_MINUTE_LIMIT}). Consider slowing down.`;
+    this.state.inspectionCountToday++;
+
+    const pctMinute = (this.state.inspectionCountThisMinute / this.URL_INSPECTION_PER_MINUTE_LIMIT) * 100;
+    const pctDay = (this.state.inspectionCountToday / this.URL_INSPECTION_PER_DAY_LIMIT) * 100;
+
+    if (pctDay >= 80) {
+      return `⚠️  URL Inspection at ${pctDay.toFixed(0)}% of the daily cap ` +
+        `(${this.state.inspectionCountToday}/${this.URL_INSPECTION_PER_DAY_LIMIT} QPD per site). ` +
+        `The daily limit is hard — remaining inspections today are limited.`;
     }
-    
+    if (pctMinute >= 80) {
+      return `⚠️  URL Inspection at ${pctMinute.toFixed(0)}% this minute ` +
+        `(${this.state.inspectionCountThisMinute}/${this.URL_INSPECTION_PER_MINUTE_LIMIT} QPM per site). Consider slowing down.`;
+    }
     return null;
   }
-  
+
   /**
-   * Calculates recommended delay for URL inspection batch operations
-   * to stay under rate limit (600/min = 1 request per 100ms minimum)
+   * Recommended delay (ms) between URL inspection calls to stay under 600 QPM.
+   * 150ms ≈ 400/min, a safe margin below the 600/min ceiling.
    */
   getRecommendedInspectionDelay(): number {
-    this.maybeResetMinute();
-    
-    const requestsThisMinute = this.state.inspectionCountThisMinute;
-    
-    // If we're approaching limit, increase delay
-    if (requestsThisMinute > 500) {
-      return 500; // 500ms delay when near limit
-    } else if (requestsThisMinute > 400) {
-      return 300;
-    } else if (requestsThisMinute > 300) {
-      return 200;
-    }
-    
-    return 150; // Default: 150ms = 400 req/min (safe margin)
+    this.rollInspection();
+    const n = this.state.inspectionCountThisMinute;
+    if (n > 500) return 500;
+    if (n > 400) return 300;
+    if (n > 300) return 200;
+    return 150;
   }
-  
+
   /**
-   * Gets current quota status
+   * Current quota status (feeds the get_quota_status tool).
    */
   getStatus(): {
-    searchAnalytics: { used: number; limit: number; percent: number };
-    urlInspection: { usedToday: number; usedThisMinute: number; minuteLimit: number };
+    searchAnalytics: { usedThisMinute: number; perMinuteLimit: number; percentThisMinute: number };
+    urlInspection: {
+      usedThisMinute: number; perMinuteLimit: number;
+      usedToday: number; perDayLimit: number; percentToday: number;
+    };
   } {
-    this.maybeResetDaily();
-    this.maybeResetMinute();
-    
+    this.rollSearchAnalytics();
+    this.rollInspection();
+
     return {
       searchAnalytics: {
-        used: this.state.searchAnalyticsCount,
-        limit: this.SEARCH_ANALYTICS_DAILY_LIMIT,
-        percent: (this.state.searchAnalyticsCount / this.SEARCH_ANALYTICS_DAILY_LIMIT) * 100,
+        usedThisMinute: this.state.saCountThisMinute,
+        perMinuteLimit: this.SEARCH_ANALYTICS_PER_MINUTE_LIMIT,
+        percentThisMinute: (this.state.saCountThisMinute / this.SEARCH_ANALYTICS_PER_MINUTE_LIMIT) * 100,
       },
       urlInspection: {
-        usedToday: this.state.urlInspectionCount,
         usedThisMinute: this.state.inspectionCountThisMinute,
-        minuteLimit: this.URL_INSPECTION_PER_MINUTE_LIMIT,
+        perMinuteLimit: this.URL_INSPECTION_PER_MINUTE_LIMIT,
+        usedToday: this.state.inspectionCountToday,
+        perDayLimit: this.URL_INSPECTION_PER_DAY_LIMIT,
+        percentToday: (this.state.inspectionCountToday / this.URL_INSPECTION_PER_DAY_LIMIT) * 100,
       },
     };
   }

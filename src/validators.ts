@@ -22,15 +22,36 @@ export function validateDateRange(startDate: string, endDate: string): void {
     throw new Error(`startDate (${startDate}) must be before or equal to endDate (${endDate})`);
   }
   
-  // GSC API supports max 16 months of data
-  const diffMonths = (end.getFullYear() - start.getFullYear()) * 12 + 
-                     (end.getMonth() - start.getMonth());
-  
-  if (diffMonths > 16) {
+  // GSC keeps ~16 months of data (about 486 days). Use a UTC-safe day count
+  // (getTime avoids the local-timezone off-by-one that getMonth would introduce).
+  const diffDays = Math.round((end.getTime() - start.getTime()) / 86_400_000);
+  if (diffDays > 486) {
     throw new Error(
-      `Date range exceeds Google Search Console limit of 16 months. ` +
-      `Requested: ${diffMonths} months (${startDate} to ${endDate}). ` +
-      `Please use a shorter date range.`
+      `Date range exceeds the Google Search Console limit of ~16 months (486 days). ` +
+      `Requested: ${diffDays} days (${startDate} to ${endDate}). Use a shorter date range.`
+    );
+  }
+}
+
+/**
+ * Validates the date range for hourly queries (dataState "hourly_all" + "hour"
+ * dimension). The Search Analytics API returns hourly data for at most the last
+ * 10 days.
+ * @see https://developers.google.com/search/blog/2025/04/san-hourly-data
+ */
+export function validateHourlyRange(startDate: string, endDate: string): void {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    throw new Error(`Invalid date for hourly query: ${startDate} to ${endDate}. Must be YYYY-MM-DD.`);
+  }
+
+  const diffDays = Math.round((end.getTime() - start.getTime()) / 86_400_000);
+  if (diffDays > 10) {
+    throw new Error(
+      `Hourly data (dataState "hourly_all") is available for at most 10 days. ` +
+      `Requested ${diffDays} days (${startDate} to ${endDate}). Use a shorter, recent range.`
     );
   }
 }
@@ -73,30 +94,16 @@ export function validateSiteUrl(siteUrl: string): string {
 export function validateRegex(pattern: string): void {
   if (!pattern) return;
   
-  // Length limit
+  // Length limit. The pattern is forwarded to the GSC API (which enforces its
+  // own limits) and is only compiled here for syntax validation, never executed
+  // against input, so there is no ReDoS surface on this server to guard.
   if (pattern.length > 500) {
     throw new Error(
       `Regex pattern too long (${pattern.length} chars). Maximum: 500 characters. ` +
       `Use simpler patterns or break into multiple queries.`
     );
   }
-  
-  // Check for potentially dangerous patterns (catastrophic backtracking)
-  const dangerousPatterns = [
-    /(\(.*\+.*\)){2,}/,  // Nested quantifiers: (a+)+
-    /(\(.*\*.*\)){2,}/,  // Nested quantifiers: (a*)*
-    /(\w\+){5,}/,        // Many consecutive greedy quantifiers
-  ];
-  
-  for (const dangerous of dangerousPatterns) {
-    if (dangerous.test(pattern)) {
-      throw new Error(
-        `Regex pattern potentially unsafe (risk of catastrophic backtracking). ` +
-        `Please simplify: ${pattern.substring(0, 100)}...`
-      );
-    }
-  }
-  
+
   // Validate it's actually valid regex
   try {
     new RegExp(pattern);
@@ -137,7 +144,9 @@ export function sanitizeForLogging(message: string): string {
     .replace(/password=["']?[^"'\s]+["']?/gi, 'password=***')
     .replace(/secret=["']?[^"'\s]+["']?/gi, 'secret=***')
     .replace(/authorization:\s*bearer\s+\S+/gi, 'authorization: Bearer ***')
-    .replace(/\/home\/[^\s"']+\/[^\/\s"']*\.(json|key|pem)/gi, '[REDACTED_PATH]');
+    // Redact absolute filesystem paths to credential-like files, on any OS user
+    // dir (/Users, /home, /root, /var, ...), not just /home.
+    .replace(/(?:\/[\w.\-]+)+\.(json|key|pem|p12)/gi, '[REDACTED_PATH]');
 }
 
 /**
@@ -163,10 +172,10 @@ export function parseGoogleApiError(err: any): Error {
   
   if (code === 429 || sanitized.toLowerCase().includes('quota')) {
     return new Error(
-      `API quota exceeded. Google Search Console has daily request limits:\n` +
-      `- searchanalytics.query: ~1,200/day\n` +
-      `- urlInspection: ~600/minute\n` +
-      `Wait 24 hours for quota reset or reduce request volume.\n` +
+      `API quota exceeded. Google Search Console per-site limits:\n` +
+      `- searchanalytics.query: 1,200 queries/minute per site\n` +
+      `- urlInspection.index.inspect: 600 queries/minute AND 2,000 queries/day per site\n` +
+      `Slow down (per-minute limits reset each minute); the URL Inspection daily cap resets after 24h.\n` +
       `Original error: ${sanitized}`
     );
   }

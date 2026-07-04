@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-gsc",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "Enhanced Model Context Protocol server for Google Search Console with 25K row limit, regex filters, and automatic quick wins detection",
   "author": "Yuexun Jiang <yuexunjiang@gmail.com>",
   "license": "MIT",
@@ -14,25 +14,26 @@
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
     "prepare": "npm run build",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "test": "node --test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "@google-cloud/local-auth": "^3.0.1",
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "google-auth-library": "^10.6.2",
-    "googleapis": "^171.4.0",
-    "zod": "^4.3.6"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "google-auth-library": "^10.9.0",
+    "googleapis": "^173.0.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^24.10.4",
+    "@types/node": "^22.0.0",
     "shx": "^0.4.0",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3"
   },
   "overrides": {
-    "buffer-equal-constant-time": "file:./patches/buffer-equal-constant-time"
+    "buffer-equal-constant-time": "file:./patches/buffer-equal-constant-time",
+    "google-auth-library": "$google-auth-library"
   }
 }

@@ -62,7 +62,7 @@ export const VALID_DEVICE_TYPES = ['DESKTOP', 'MOBILE', 'TABLET'] as const;
  * Valid data states for freshness control
  * @see https://developers.google.com/webmaster-tools/v1/searchanalytics/query
  */
-export const VALID_DATA_STATES = ['all', 'final'] as const;
+export const VALID_DATA_STATES = ['all', 'final', 'hourly_all'] as const;
 
 // ============================================================================
 // Validation Helpers
@@ -140,7 +140,7 @@ export const SearchAnalyticsSchema = GSCBaseSchema.extend({
   dataState: z
     .enum(VALID_DATA_STATES)
     .default('final')
-    .describe('Data freshness: "all" includes fresh unfinalized data, "final" for finalized only'),
+    .describe('Data freshness: "final" = finalized only; "all" = includes fresh unfinalized data; "hourly_all" = hourly data (pair with the "hour" dimension; range must be ≤10 days)'),
   pageFilter: z
     .string()
     .optional()
@@ -158,6 +158,10 @@ export const SearchAnalyticsSchema = GSCBaseSchema.extend({
     .enum(VALID_DEVICE_TYPES)
     .optional()
     .describe('Filter by device type'),
+  searchAppearanceFilter: z
+    .string()
+    .optional()
+    .describe('Filter by search appearance type (e.g., AMP_BLUE_LINK, RICHCARD). Query with the searchAppearance dimension first to discover available values.'),
   filterOperator: z
     .enum(VALID_FILTER_OPERATORS)
     .default('equals')
@@ -222,6 +226,47 @@ export const QuickWinsDetectionSchema = GSCBaseSchema.extend({
     .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
     .describe('End date in YYYY-MM-DD format'),
 }).merge(QuickWinsThresholdsSchema);
+
+// ============================================================================
+// Pagination Schema (fetch beyond the 25k-per-request cap)
+// ============================================================================
+
+// Everything from SearchAnalyticsSchema except the per-request rowLimit/startRow,
+// which the paginator manages internally.
+export const SearchAnalyticsAllSchema = SearchAnalyticsSchema.omit({
+  rowLimit: true,
+  startRow: true,
+}).extend({
+  maxRows: z
+    .coerce.number()
+    .int()
+    .min(1)
+    .max(50000)
+    .default(25000)
+    .describe('Total rows to fetch across pages (1-50,000). The API caps data at ~50,000 rows/day per property per search type.'),
+});
+
+// ============================================================================
+// Period Comparison Schema
+// ============================================================================
+
+export const ComparePeriodsSchema = SearchAnalyticsSchema.extend({
+  compareStartDate: z
+    .string()
+    .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
+    .describe('Comparison period start date (YYYY-MM-DD). startDate/endDate define the primary period; this pair defines the period to compare against.'),
+  compareEndDate: z
+    .string()
+    .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
+    .describe('Comparison period end date (YYYY-MM-DD)'),
+  topN: z
+    .coerce.number()
+    .int()
+    .min(1)
+    .max(1000)
+    .default(25)
+    .describe('When grouped by dimensions, how many top movers (by |click delta|) to return'),
+});
 
 export const EnhancedSearchAnalyticsSchema = SearchAnalyticsSchema.extend({
   regexFilter: z
@@ -361,18 +406,8 @@ export const RichResultsCheckSchema = GSCBaseSchema.extend({
 });
 
 // ============================================================================
-// Type Exports
+// Type Exports (only the inferred types actually consumed elsewhere)
 // ============================================================================
 
 export type SearchAnalytics = z.infer<typeof SearchAnalyticsSchema>;
-export type EnhancedSearchAnalytics = z.infer<typeof EnhancedSearchAnalyticsSchema>;
-export type QuickWinsDetection = z.infer<typeof QuickWinsDetectionSchema>;
 export type QuickWinsThresholds = z.infer<typeof QuickWinsThresholdsSchema>;
-export type IndexInspect = z.infer<typeof IndexInspectSchema>;
-export type ListSitemaps = z.infer<typeof ListSitemapsSchema>;
-export type GetSitemap = z.infer<typeof GetSitemapSchema>;
-export type SubmitSitemap = z.infer<typeof SubmitSitemapSchema>;
-export type DeleteSitemap = z.infer<typeof DeleteSitemapSchema>;
-export type BatchInspect = z.infer<typeof BatchInspectSchema>;
-export type CoverageReport = z.infer<typeof CoverageReportSchema>;
-export type RichResultsCheck = z.infer<typeof RichResultsCheckSchema>;

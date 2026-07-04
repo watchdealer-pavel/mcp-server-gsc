@@ -6,32 +6,37 @@
 
 <p align="center">
   <strong>MCP server for Google Search Console.</strong><br>
-  Search analytics, quick wins detection, URL inspection, sitemap management.<br>
+  Search analytics, quick-wins detection, URL inspection, sitemap management.<br>
   Works with OpenClaw, Claude Code, Cursor, or any MCP client.
 </p>
 
 ---
 
-## What It Does
+## What it does
 
-Gives your AI agent direct access to Google Search Console data through 12 tools:
+Gives your AI agent direct access to Google Search Console through 15 tools:
 
 | Tool | What it does |
 |------|-------------|
-| `list_sites` | List all GSC properties you have access to |
-| `search_analytics` | Query clicks, impressions, CTR, position (up to 25K rows) |
-| `enhanced_search_analytics` | Regex filtering + auto quick-wins detection |
+| `list_sites` | List the GSC properties you have access to |
+| `search_analytics` | Query clicks, impressions, CTR, and position (up to 25K rows) |
+| `search_analytics_all` | Page past the 25K-per-request cap, up to ~50K rows |
+| `enhanced_search_analytics` | Regex filtering plus automatic quick-wins detection |
+| `compare_periods` | Diff two date ranges: totals, deltas, and the queries that moved most |
 | `detect_quick_wins` | Find high-impression, low-CTR keywords with revenue estimates |
-| `index_inspect` | Check indexing status of a single URL |
-| `batch_inspect` | Inspect multiple URLs, grouped by verdict (PASS/FAIL/PARTIAL) |
-| `coverage_report` | Cross-reference sitemap vs analytics — find orphaned pages |
+| `index_inspect` | Check the indexing status of a single URL |
+| `batch_inspect` | Inspect many URLs at once, grouped by verdict (PASS/FAIL/PARTIAL) |
+| `coverage_report` | Cross-reference sitemap URLs against analytics to find orphaned pages |
 | `rich_results_check` | Audit structured data (Product, FAQ, Review snippets) |
 | `list_sitemaps` | List submitted sitemaps |
 | `get_sitemap` | Get details for a specific sitemap |
 | `submit_sitemap` | Submit a new sitemap |
 | `delete_sitemap` | Remove a sitemap |
+| `get_quota_status` | Report the API quota usage the server is tracking |
 
-Built-in input validation (date ranges, siteUrl format, 16-month limit), quota tracking (daily search analytics, per-minute URL inspection), and numeric coercion for all parameters.
+**Hourly data.** `search_analytics` supports Google's hourly export. Pass `dimensions: "hour"` with `dataState: "hourly_all"` and a range of 10 days or less to get hour-by-hour clicks and impressions.
+
+Every tool validates its input (date ranges, siteUrl format, the 16-month window) and coerces numeric parameters for you. The server also tracks API quota per site and warns before you run into the limits.
 
 ---
 
@@ -44,7 +49,7 @@ npm install
 npm run build
 ```
 
-This gives you the binary at `./dist/index.js`. Point your MCP client at it with `node /path/to/mcp-server-gsc/dist/index.js`.
+This builds the binary at `./dist/index.js`. Point your MCP client at it with `node /path/to/mcp-server-gsc/dist/index.js`.
 
 ---
 
@@ -52,16 +57,16 @@ This gives you the binary at `./dist/index.js`. Point your MCP client at it with
 
 ### 1. Create a Google Cloud service account
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/) → create or select a project
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create or select a project
 2. Enable the **Search Console API** in [APIs & Services → Library](https://console.cloud.google.com/apis/library)
-3. Go to **IAM & Admin → Service Accounts** → create a service account
+3. Go to **IAM & Admin → Service Accounts** and create a service account
 4. Create a **JSON key** and download it
-5. Store it somewhere safe (e.g. `~/.config/gsc/credentials.json`)
+5. Store it somewhere safe (for example `~/.config/gsc/credentials.json`)
 
 ### 2. Grant access in Search Console
 
 1. Open [Google Search Console](https://search.google.com/search-console)
-2. Select your property → **Settings → Users and permissions**
+2. Select your property, then go to **Settings → Users and permissions**
 3. Add the service account email as **Owner**
 
 Repeat for each property you want to access.
@@ -102,17 +107,17 @@ Add to `.mcp.json` or via Settings → MCP Servers:
 }
 ```
 
-#### Cursor / Windsurf / Other MCP clients
+#### Cursor / Windsurf / other MCP clients
 
-Same pattern — point at `node /path/to/mcp-server-gsc/dist/index.js` with `GOOGLE_APPLICATION_CREDENTIALS` set.
+Same pattern: point at `node /path/to/mcp-server-gsc/dist/index.js` with `GOOGLE_APPLICATION_CREDENTIALS` set.
 
 ---
 
 ## Usage
 
-### Find Quick Wins
+### Find quick wins
 
-The main reason this exists. Find keywords where you're getting impressions but not clicks:
+The main reason this exists. Find keywords where you get impressions but not clicks:
 
 ```
 Tool: detect_quick_wins
@@ -128,11 +133,27 @@ Tool: detect_quick_wins
   conversionRate: 0.02
 ```
 
-Returns prioritized opportunities with estimated monthly revenue impact per keyword.
+Returns prioritized opportunities with an estimated revenue impact per keyword.
 
-### Search Analytics with Regex
+### Compare two periods
 
-Filter queries by pattern — useful for topic-specific analysis:
+See what changed between two date ranges:
+
+```
+Tool: compare_periods
+  siteUrl: "sc-domain:example.com"
+  startDate: "2026-02-01"
+  endDate: "2026-02-28"
+  compareStartDate: "2026-01-01"
+  compareEndDate: "2026-01-31"
+  dimensions: "query"
+```
+
+Returns totals for both periods, the deltas and percentage change, and the queries that moved the most.
+
+### Search analytics with regex
+
+Filter queries by pattern, useful for topic-specific analysis:
 
 ```
 Tool: enhanced_search_analytics
@@ -145,7 +166,20 @@ Tool: enhanced_search_analytics
   enableQuickWins: true
 ```
 
-### Coverage Audit
+### Pull more than 25,000 rows
+
+When one request is not enough, this pages through the API and returns the combined rows:
+
+```
+Tool: search_analytics_all
+  siteUrl: "sc-domain:example.com"
+  startDate: "2026-01-01"
+  endDate: "2026-03-20"
+  dimensions: "query,page"
+  maxRows: 50000
+```
+
+### Coverage audit
 
 Find pages missing from your sitemap or getting zero impressions:
 
@@ -156,9 +190,9 @@ Tool: coverage_report
   endDate: "2026-03-20"
 ```
 
-### Structured Data Check
+### Structured data check
 
-Verify rich results eligibility across your top pages:
+Verify rich-results eligibility across your top pages:
 
 ```
 Tool: rich_results_check
@@ -166,32 +200,19 @@ Tool: rich_results_check
   maxUrls: 20
 ```
 
-### Basic Analytics
-
-Standard GSC query — clicks, impressions, CTR, position:
-
-```
-Tool: search_analytics
-  siteUrl: "sc-domain:example.com"
-  startDate: "2026-01-01"
-  endDate: "2026-03-20"
-  dimensions: "query"
-  rowLimit: 1000
-```
-
 ---
 
-## Good to Know
+## Good to know
 
-**siteUrl format** — Use `sc-domain:example.com` for domain properties, `https://www.example.com/` for URL-prefix. Run `list_sites` to see the exact format.
+**siteUrl format.** Use `sc-domain:example.com` for domain properties or `https://www.example.com/` for URL-prefix properties. Run `list_sites` to see the exact string.
 
-**Data freshness** — GSC data lags 2-3 days. Use `dataState: "all"` to include unfinalized recent data.
+**Data freshness.** GSC data lags two to three days. Use `dataState: "all"` to include recent unfinalized data, or `dataState: "hourly_all"` with the `hour` dimension for hourly data over the last 10 days.
 
-**Row limits** — Default 1,000, max 25,000. Paginate with `startRow` for larger datasets.
+**Row limits.** One request returns up to 25,000 rows. For more, use `search_analytics_all`, which pages up to 50,000. The API caps data at roughly 50,000 rows per day per property per search type.
 
-**Date ranges** — Max 16 months per GSC API limit. Format: `YYYY-MM-DD`.
+**Date ranges.** Up to 16 months, formatted `YYYY-MM-DD`.
 
-**Quota** — Search Analytics: ~1,200 requests/day. URL Inspection: ~600/minute. The server tracks usage internally, warns at 80%, and auto-throttles batch operations.
+**Quota.** Google's per-site limits are 1,200 queries per minute for Search Analytics, and 600 per minute plus 2,000 per day for URL Inspection. The server tracks usage, warns at 80%, throttles batch inspections automatically, and reports what it sees through `get_quota_status`.
 
 ---
 
@@ -199,10 +220,10 @@ Tool: search_analytics
 
 | Problem | Fix |
 |---------|-----|
-| Permission denied | Add service account email as **Owner** in Search Console → Settings → Users |
-| Invalid siteUrl | Use exact format from `list_sites` — common mistake: `example.com` instead of `sc-domain:example.com` |
-| Quota exceeded | Wait for daily reset or reduce batch sizes |
-| Date range error | Max 16 months. Break into multiple queries |
+| Permission denied | Add the service account email as **Owner** in Search Console → Settings → Users |
+| Invalid siteUrl | Use the exact string from `list_sites`. A common mistake is `example.com` instead of `sc-domain:example.com` |
+| Quota exceeded | Per-minute limits reset each minute; the URL Inspection daily cap resets after 24 hours. Reduce batch sizes if you hit it often |
+| Date range error | The limit is 16 months. Break longer spans into multiple queries |
 | Search Console API not found | Enable it in Google Cloud Console → APIs & Services → Library |
 
 ---
@@ -214,5 +235,5 @@ MIT
 ---
 
 <p align="center">
-  <sub>Originally based on <a href="https://github.com/ahonn/mcp-server-gsc">ahonn/mcp-server-gsc</a>. Rewritten with input validation, quota tracking, quick wins detection, and batch tools.</sub>
+  <sub>Originally based on <a href="https://github.com/ahonn/mcp-server-gsc">ahonn/mcp-server-gsc</a>. Rewritten with input validation, quota tracking, quick-wins detection, and batch tools.</sub>
 </p>
