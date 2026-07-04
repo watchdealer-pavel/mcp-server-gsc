@@ -92,6 +92,22 @@ test('fetchSitemapUrls discovers via robots.txt and gunzips child sitemaps', asy
   assert.deepEqual(urls, ['https://ex.com/g1']);
 });
 
+test('fetchSitemapUrls aggregates multiple independent sitemaps from robots.txt', async () => {
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  const routes = {
+    'https://ex.com/robots.txt': { text: 'Sitemap: https://ex.com/a.xml\nSitemap: https://ex.com/b.xml' },
+    'https://ex.com/a.xml': { text: '<urlset><url><loc>https://ex.com/p1</loc></url></urlset>' },
+    'https://ex.com/b.xml': { text: '<urlset><url><loc>https://ex.com/p2</loc></url></urlset>' },
+  };
+  globalThis.fetch = async (url) => {
+    const r = routes[url];
+    return r ? { ok: true, text: async () => r.text, arrayBuffer: async () => Buffer.alloc(0) }
+             : { ok: false, text: async () => '', arrayBuffer: async () => Buffer.alloc(0) };
+  };
+  const urls = await svc.fetchSitemapUrls('sc-domain:ex.com');
+  assert.deepEqual(urls.sort(), ['https://ex.com/p1', 'https://ex.com/p2']);
+});
+
 test('coverageReport matches URLs across www/scheme/trailing-slash differences', async () => {
   const svc = new SearchConsoleService('/tmp/dummy.json', true);
   svc.fetchSitemapUrls = async () => ['https://www.ex.com/a/', 'http://ex.com/b', 'https://ex.com/orphan'];

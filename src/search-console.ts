@@ -308,29 +308,21 @@ export class SearchConsoleService {
   ): Promise<PeriodComparison> {
     const hasDims = Array.isArray(requestBodyA?.dimensions) && requestBodyA!.dimensions!.length > 0;
 
-    // Grouped queries (for per-key movers). When there are no dimensions these
-    // ARE the totals, so we reuse them and skip the extra pair of calls.
-    const [a, b] = await Promise.all([
+    // Grouped queries drive the per-key movers; a separate dimensionless query per
+    // period gives accurate totals (keeping any filters). With no dimensions the
+    // grouped query IS the total, so we skip the extra pair. All fired in parallel.
+    const bare = (r: SearchAnalyticsQueryRequest) => ({ ...r, dimensions: [], rowLimit: 1, startRow: 0 });
+    const [a, b, ta, tb] = await Promise.all([
       this.searchAnalytics(siteUrl, requestBodyA),
       this.searchAnalytics(siteUrl, requestBodyB),
+      hasDims ? this.searchAnalytics(siteUrl, bare(requestBodyA)) : Promise.resolve(null),
+      hasDims ? this.searchAnalytics(siteUrl, bare(requestBodyB)) : Promise.resolve(null),
     ]);
     const rowsA = (a.data.rows || []) as SearchAnalyticsRow[];
     const rowsB = (b.data.rows || []) as SearchAnalyticsRow[];
 
-    // Accurate period totals: dimensionless single-row queries (keep any filters).
-    const bare = (r: SearchAnalyticsQueryRequest) => ({ ...r, dimensions: [], rowLimit: 1, startRow: 0 });
-    let totalsA: PeriodTotals, totalsB: PeriodTotals;
-    if (hasDims) {
-      const [ta, tb] = await Promise.all([
-        this.searchAnalytics(siteUrl, bare(requestBodyA)),
-        this.searchAnalytics(siteUrl, bare(requestBodyB)),
-      ]);
-      totalsA = this.aggregateTotals((ta.data.rows || []) as SearchAnalyticsRow[]);
-      totalsB = this.aggregateTotals((tb.data.rows || []) as SearchAnalyticsRow[]);
-    } else {
-      totalsA = this.aggregateTotals(rowsA);
-      totalsB = this.aggregateTotals(rowsB);
-    }
+    const totalsA = this.aggregateTotals(((hasDims ? ta! : a).data.rows || []) as SearchAnalyticsRow[]);
+    const totalsB = this.aggregateTotals(((hasDims ? tb! : b).data.rows || []) as SearchAnalyticsRow[]);
     const pct = (from: number, to: number) => from === 0 ? (to === 0 ? 0 : null) : Number((((to - from) / from) * 100).toFixed(1));
 
     const result: PeriodComparison = {
@@ -729,21 +721,10 @@ export class SearchConsoleService {
       ? siteUrl.replace('sc-domain:', '')
       : (() => { try { return new URL(siteUrl).hostname; } catch { return siteUrl; } })();
 
-    // Candidate sitemap URLs: robots.txt Sitemap: directives first, then common paths.
-    const candidates = new Set<string>();
-    const robots = await this.fetchText(`https://${domain}/robots.txt`);
-    if (robots) {
-      for (const m of robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)) candidates.add(m[1].trim());
-    }
-    candidates.add(`https://${domain}/sitemap.xml`);
-    candidates.add(`https://${domain}/sitemap_index.xml`);
-    candidates.add(`https://www.${domain}/sitemap.xml`);
-
-    for (const url of candidates) {
-      const xml = await this.fetchText(url);
-      if (!xml) continue;
-
-      // Sitemap index: follow child sitemaps (capped, concurrent).
+    // Resolve one sitemap URL into page URLs, following one level of sitemap index.
+    const collectFrom = async (sitemapUrl: string): Promise<string[]> => {
+      const xml = await this.fetchText(sitemapUrl);
+      if (!xml) return [];
       const childLocs = [...xml.matchAll(/<sitemap>\s*<loc>\s*(.*?)\s*<\/loc>/gs)].map(m => m[1].trim());
       if (childLocs.length > 0) {
         if (childLocs.length > SearchConsoleService.MAX_CHILD_SITEMAPS) {
@@ -751,13 +732,30 @@ export class SearchConsoleService {
         }
         const children = childLocs.slice(0, SearchConsoleService.MAX_CHILD_SITEMAPS);
         const results = await Promise.all(children.map(c => this.fetchText(c)));
-        const allUrls = results.flatMap(cx => (cx ? this.extractLocs(cx) : []));
-        if (allUrls.length > 0) return allUrls;
+        return results.flatMap(cx => (cx ? this.extractLocs(cx) : []));
       }
+      return this.extractLocs(xml);
+    };
 
-      // Regular sitemap.
-      const locs = this.extractLocs(xml);
-      if (locs.length > 0) return locs;
+    // Prefer robots.txt-declared sitemaps, aggregating across ALL of them (a site
+    // may list several independent top-level sitemaps rather than one index).
+    const robots = await this.fetchText(`https://${domain}/robots.txt`);
+    const declared = robots
+      ? [...robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)].map(m => m[1].trim())
+      : [];
+    if (declared.length > 0) {
+      const all = (await Promise.all(declared.map(collectFrom))).flat();
+      if (all.length > 0) return [...new Set(all)];
+    }
+
+    // Fallback: guess common paths, first that yields.
+    for (const url of [
+      `https://${domain}/sitemap.xml`,
+      `https://${domain}/sitemap_index.xml`,
+      `https://www.${domain}/sitemap.xml`,
+    ]) {
+      const urls = await collectFrom(url);
+      if (urls.length > 0) return [...new Set(urls)];
     }
 
     return [];
