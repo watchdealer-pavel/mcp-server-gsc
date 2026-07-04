@@ -8,6 +8,7 @@ import { sanitizeForLogging } from './validators.js';
 
 import {
   BatchInspectSchema,
+  ComparePeriodsSchema,
   CoverageReportSchema,
   DeleteSitemapSchema,
   EnhancedSearchAnalyticsSchema,
@@ -16,6 +17,7 @@ import {
   ListSitemapsSchema,
   QuickWinsDetectionSchema,
   RichResultsCheckSchema,
+  SearchAnalyticsAllSchema,
   SearchAnalyticsSchema,
   SubmitSitemapSchema,
   type SearchAnalytics,
@@ -27,7 +29,8 @@ import { SearchConsoleService } from './search-console.js';
 // ============================================================================
 
 const SERVER_NAME = 'gsc-mcp-server';
-const SERVER_VERSION = '0.2.2';
+// Keep in sync with "version" in package.json
+const SERVER_VERSION = '0.5.0';
 
 // ============================================================================
 // Environment & Service Initialization
@@ -60,10 +63,15 @@ function formatResponse(data: unknown): { content: Array<{ type: 'text'; text: s
   };
 }
 
+// Query args shared by search_analytics, search_analytics_all (no rowLimit/startRow),
+// and compare_periods — rowLimit/startRow are optional so all three are accepted.
+type QueryArgs = Omit<SearchAnalytics, 'rowLimit' | 'startRow'> &
+  Partial<Pick<SearchAnalytics, 'rowLimit' | 'startRow'>>;
+
 /**
  * Builds dimension filter groups from search analytics arguments
  */
-function buildFilterGroups(args: SearchAnalytics): Array<{
+function buildFilterGroups(args: QueryArgs): Array<{
   groupType: 'and';
   filters: Array<{ dimension: string; operator: string; expression: string }>;
 }> | undefined {
@@ -85,7 +93,7 @@ function buildFilterGroups(args: SearchAnalytics): Array<{
     });
   }
 
-  // Country and device only support 'equals' operator
+  // Country, device, and searchAppearance only support 'equals' operator
   if (args.countryFilter) {
     filters.push({
       dimension: 'country',
@@ -102,13 +110,21 @@ function buildFilterGroups(args: SearchAnalytics): Array<{
     });
   }
 
+  if (args.searchAppearanceFilter) {
+    filters.push({
+      dimension: 'searchAppearance',
+      operator: 'equals',
+      expression: args.searchAppearanceFilter,
+    });
+  }
+
   return filters.length > 0 ? [{ groupType: 'and', filters }] : undefined;
 }
 
 /**
  * Builds search analytics request body from parsed arguments
  */
-function buildSearchAnalyticsRequest(args: SearchAnalytics) {
+function buildSearchAnalyticsRequest(args: QueryArgs) {
   return {
     startDate: args.startDate,
     endDate: args.endDate,
@@ -160,6 +176,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: 'enhanced_search_analytics',
         description: 'Advanced search analytics with up to 25,000 rows, regex filters, data freshness control, and optional quick wins detection',
         inputSchema: z.toJSONSchema(EnhancedSearchAnalyticsSchema),
+      },
+      {
+        name: 'search_analytics_all',
+        description: 'Fetch search analytics beyond the 25,000-row-per-request cap by auto-paginating (up to 50,000 rows; the API caps data at ~50k/day per property per search type)',
+        inputSchema: z.toJSONSchema(SearchAnalyticsAllSchema),
+      },
+      {
+        name: 'compare_periods',
+        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions',
+        inputSchema: z.toJSONSchema(ComparePeriodsSchema),
+      },
+      {
+        name: 'get_quota_status',
+        description: 'Report current API quota usage this process is tracking (Search Analytics per-minute; URL Inspection per-minute and per-day, per site)',
+        inputSchema: z.toJSONSchema(z.object({})),
       },
       {
         name: 'detect_quick_wins',
@@ -253,6 +284,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return formatResponse(response.data);
+      }
+
+      case 'search_analytics_all': {
+        const parsed = SearchAnalyticsAllSchema.parse(args);
+        const requestBody = buildSearchAnalyticsRequest(parsed);
+        const response = await searchConsoleService.searchAnalyticsPaginated(
+          parsed.siteUrl,
+          requestBody,
+          parsed.maxRows,
+        );
+        return formatResponse(response.data);
+      }
+
+      case 'compare_periods': {
+        const parsed = ComparePeriodsSchema.parse(args);
+        const requestBodyA = buildSearchAnalyticsRequest(parsed);
+        const requestBodyB = buildSearchAnalyticsRequest({
+          ...parsed,
+          startDate: parsed.compareStartDate,
+          endDate: parsed.compareEndDate,
+        });
+        const response = await searchConsoleService.comparePeriods(
+          parsed.siteUrl,
+          requestBodyA,
+          requestBodyB,
+          parsed.topN,
+        );
+        return formatResponse(response);
+      }
+
+      case 'get_quota_status': {
+        return formatResponse(searchConsoleService.getQuotaStatus());
       }
 
       case 'detect_quick_wins': {

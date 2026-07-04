@@ -1,7 +1,8 @@
-import { google, searchconsole_v1, webmasters_v3 } from 'googleapis';
+import { gunzipSync } from 'node:zlib';
+import { google, searchconsole_v1 } from 'googleapis';
 import { GoogleAuth, AuthClient } from 'google-auth-library';
 import { QuickWinsThresholds } from './schemas.js';
-import { validateDateRange, validateSiteUrl, validateRegex, validateArrayLength, parseGoogleApiError } from './validators.js';
+import { validateDateRange, validateHourlyRange, validateSiteUrl, validateRegex, validateArrayLength, parseGoogleApiError } from './validators.js';
 import { QuotaTracker } from './quota-tracker.js';
 
 // ============================================================================
@@ -49,6 +50,15 @@ export interface EnhancedSearchAnalyticsResponse {
     rowLimit: number;
     totalRows: number;
   };
+  /**
+   * Data-freshness metadata returned by the API. `firstIncompleteHour` is
+   * populated for hourly queries (dataState "hourly_all"); `firstIncompleteDate`
+   * for daily queries with dataState "all". Values after these points may still change.
+   */
+  apiMetadata?: {
+    firstIncompleteDate?: string | null;
+    firstIncompleteHour?: string | null;
+  };
 }
 
 /**
@@ -60,11 +70,38 @@ export interface EnhancedSearchAnalyticsOptions {
   quickWinsThresholds?: Partial<QuickWinsThresholds>;
 }
 
-type SearchAnalyticsQueryRequest = webmasters_v3.Params$Resource$Searchanalytics$Query['requestBody'];
-type ListSitemapsRequest = webmasters_v3.Params$Resource$Sitemaps$List;
-type GetSitemapRequest = webmasters_v3.Params$Resource$Sitemaps$Get;
-type SubmitSitemapRequest = webmasters_v3.Params$Resource$Sitemaps$Submit;
-type DeleteSitemapRequest = webmasters_v3.Params$Resource$Sitemaps$Delete;
+/** Aggregated totals for a period */
+export interface PeriodTotals {
+  clicks: number;
+  impressions: number;
+  ctr: number;
+  position: number;
+}
+
+/** Result of comparing two date ranges */
+export interface PeriodComparison {
+  periodA: { startDate: string | null; endDate: string | null; totals: PeriodTotals };
+  periodB: { startDate: string | null; endDate: string | null; totals: PeriodTotals };
+  delta: {
+    clicks: { abs: number; pct: number | null };
+    impressions: { abs: number; pct: number | null };
+    ctr: { abs: number };
+    position: { abs: number };
+  };
+  totalKeys?: number;
+  topChanges?: Array<{
+    key: string;
+    clicks: { a: number; b: number; delta: number };
+    impressions: { a: number; b: number; delta: number };
+    position: { a: number | null; b: number | null; delta: number | null };
+  }>;
+}
+
+type SearchAnalyticsQueryRequest = searchconsole_v1.Params$Resource$Searchanalytics$Query['requestBody'];
+type ListSitemapsRequest = searchconsole_v1.Params$Resource$Sitemaps$List;
+type GetSitemapRequest = searchconsole_v1.Params$Resource$Sitemaps$Get;
+type SubmitSitemapRequest = searchconsole_v1.Params$Resource$Sitemaps$Submit;
+type DeleteSitemapRequest = searchconsole_v1.Params$Resource$Sitemaps$Delete;
 type IndexInspectRequest = searchconsole_v1.Params$Resource$Urlinspection$Index$Inspect['requestBody'];
 
 // ============================================================================
@@ -121,20 +158,14 @@ export class SearchConsoleService {
   }
 
   /**
-   * Gets webmasters v3 API client (cached)
+   * Gets the Search Console v1 API client.
+   *
+   * v1 (`searchconsole`) is the canonical namespace and a superset: it exposes
+   * searchanalytics, sitemaps, sites, and urlInspection — so a single client
+   * covers every call this service makes (the legacy `webmasters` v3 namespace
+   * is no longer needed).
    */
-  private async getWebmasters(): Promise<webmasters_v3.Webmasters> {
-    const authClient = await this.getAuthClient();
-    return google.webmasters({
-      version: 'v3',
-      auth: authClient,
-    } as webmasters_v3.Options);
-  }
-
-  /**
-   * Gets searchconsole v1 API client (cached)
-   */
-  private async getSearchConsole(): Promise<searchconsole_v1.Searchconsole> {
+  private async getClient(): Promise<searchconsole_v1.Searchconsole> {
     const authClient = await this.getAuthClient();
     return google.searchconsole({
       version: 'v1',
@@ -162,7 +193,10 @@ export class SearchConsoleService {
   }
 
   /**
-   * Wraps an operation with automatic fallback to normalized URL on permission error
+   * Wraps an operation with an automatic retry against the normalized sc-domain
+   * URL on permission errors, and converts any failure into an actionable error
+   * via parseGoogleApiError. This is the single error-handling path for every
+   * API call in this service, so callers do not need their own try/catch.
    */
   private async withPermissionFallback<T>(
     operation: () => Promise<T>,
@@ -176,11 +210,14 @@ export class SearchConsoleService {
 
       if (errorMessage.includes('permission') || errorMessage.includes('403')) {
         console.error(`[GSC] Permission error in ${context}, trying normalized URL...`);
-        return await fallbackOperation();
+        try {
+          return await fallbackOperation();
+        } catch (fallbackErr) {
+          throw parseGoogleApiError(fallbackErr);
+        }
       }
 
-      // Re-throw with context
-      throw new Error(`[GSC] ${context} failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw parseGoogleApiError(err);
     }
   }
 
@@ -193,32 +230,163 @@ export class SearchConsoleService {
    * @see https://developers.google.com/webmaster-tools/v1/searchanalytics/query
    */
   async searchAnalytics(siteUrl: string, requestBody: SearchAnalyticsQueryRequest) {
-    // Validate inputs
     validateSiteUrl(siteUrl);
     if (requestBody?.startDate && requestBody?.endDate) {
       validateDateRange(requestBody.startDate, requestBody.endDate);
+      // Hourly data (dataState "hourly_all") is limited to the last 10 days.
+      if (requestBody.dataState === 'hourly_all') {
+        validateHourlyRange(requestBody.startDate, requestBody.endDate);
+      }
     }
-    
-    // Track quota and warn if approaching limit
+
     const quotaWarning = this.quotaTracker.recordSearchAnalytics();
     if (quotaWarning) {
       console.error(quotaWarning);
     }
     
-    const webmasters = await this.getWebmasters();
+    const webmasters = await this.getClient();
 
-    try {
-      return await this.withPermissionFallback(
-        () => webmasters.searchanalytics.query({ siteUrl, requestBody }),
-        () => webmasters.searchanalytics.query({
-          siteUrl: this.normalizeUrl(siteUrl),
-          requestBody
-        }),
-        'searchAnalytics',
-      );
-    } catch (err) {
-      throw parseGoogleApiError(err);
+    return this.withPermissionFallback(
+      () => webmasters.searchanalytics.query({ siteUrl, requestBody }),
+      () => webmasters.searchanalytics.query({
+        siteUrl: this.normalizeUrl(siteUrl),
+        requestBody,
+      }),
+      'searchAnalytics',
+    );
+  }
+
+  /**
+   * Returns current API quota usage (per-minute / per-day, per site).
+   */
+  getQuotaStatus() {
+    return this.quotaTracker.getStatus();
+  }
+
+  /**
+   * Fetches search analytics rows beyond the 25,000-per-request cap by paginating
+   * `startRow`, up to `maxRows`. Bounded in practice by the API's ~50,000
+   * rows/day/searchType data cap.
+   */
+  async searchAnalyticsPaginated(
+    siteUrl: string,
+    requestBody: SearchAnalyticsQueryRequest,
+    maxRows: number,
+  ): Promise<{ data: { rows: SearchAnalyticsRow[]; totalRows: number; pagesFetched: number; reachedEnd: boolean } }> {
+    const PAGE = 25000;
+    const all: SearchAnalyticsRow[] = [];
+    let startRow = 0;
+    let pagesFetched = 0;
+    let reachedEnd = false;
+
+    while (all.length < maxRows) {
+      const pageLimit = Math.min(PAGE, maxRows - all.length);
+      const resp = await this.searchAnalytics(siteUrl, { ...requestBody, rowLimit: pageLimit, startRow });
+      const rows = (resp.data.rows || []) as SearchAnalyticsRow[];
+      pagesFetched++;
+      all.push(...rows);
+      if (rows.length < pageLimit) { reachedEnd = true; break; }
+      startRow += rows.length;
     }
+
+    return { data: { rows: all.slice(0, maxRows), totalRows: Math.min(all.length, maxRows), pagesFetched, reachedEnd } };
+  }
+
+  /**
+   * Compares two date ranges: per-period totals plus deltas, and — when
+   * dimensions are supplied — per-key differences for the biggest movers.
+   *
+   * Totals come from a separate dimensionless query per period. Summing
+   * dimension rows would understate them badly, because a grouped query is
+   * capped at rowLimit and GSC omits anonymized long-tail queries entirely.
+   */
+  async comparePeriods(
+    siteUrl: string,
+    requestBodyA: SearchAnalyticsQueryRequest,
+    requestBodyB: SearchAnalyticsQueryRequest,
+    topN: number = 25,
+  ): Promise<PeriodComparison> {
+    const hasDims = Array.isArray(requestBodyA?.dimensions) && requestBodyA!.dimensions!.length > 0;
+
+    // Grouped queries (for per-key movers). When there are no dimensions these
+    // ARE the totals, so we reuse them and skip the extra pair of calls.
+    const [a, b] = await Promise.all([
+      this.searchAnalytics(siteUrl, requestBodyA),
+      this.searchAnalytics(siteUrl, requestBodyB),
+    ]);
+    const rowsA = (a.data.rows || []) as SearchAnalyticsRow[];
+    const rowsB = (b.data.rows || []) as SearchAnalyticsRow[];
+
+    // Accurate period totals: dimensionless single-row queries (keep any filters).
+    const bare = (r: SearchAnalyticsQueryRequest) => ({ ...r, dimensions: [], rowLimit: 1, startRow: 0 });
+    let totalsA: PeriodTotals, totalsB: PeriodTotals;
+    if (hasDims) {
+      const [ta, tb] = await Promise.all([
+        this.searchAnalytics(siteUrl, bare(requestBodyA)),
+        this.searchAnalytics(siteUrl, bare(requestBodyB)),
+      ]);
+      totalsA = this.aggregateTotals((ta.data.rows || []) as SearchAnalyticsRow[]);
+      totalsB = this.aggregateTotals((tb.data.rows || []) as SearchAnalyticsRow[]);
+    } else {
+      totalsA = this.aggregateTotals(rowsA);
+      totalsB = this.aggregateTotals(rowsB);
+    }
+    const pct = (from: number, to: number) => from === 0 ? (to === 0 ? 0 : null) : Number((((to - from) / from) * 100).toFixed(1));
+
+    const result: PeriodComparison = {
+      periodA: { startDate: requestBodyA?.startDate ?? null, endDate: requestBodyA?.endDate ?? null, totals: totalsA },
+      periodB: { startDate: requestBodyB?.startDate ?? null, endDate: requestBodyB?.endDate ?? null, totals: totalsB },
+      delta: {
+        clicks: { abs: totalsB.clicks - totalsA.clicks, pct: pct(totalsA.clicks, totalsB.clicks) },
+        impressions: { abs: totalsB.impressions - totalsA.impressions, pct: pct(totalsA.impressions, totalsB.impressions) },
+        ctr: { abs: Number((totalsB.ctr - totalsA.ctr).toFixed(2)) },
+        position: { abs: Number((totalsB.position - totalsA.position).toFixed(1)) },
+      },
+    };
+
+    // Per-key diff when grouped by dimensions.
+    const dims = requestBodyA?.dimensions;
+    if (dims && dims.length > 0) {
+      const keyOf = (r: SearchAnalyticsRow) => (r.keys || []).join(' | ');
+      const mapA = new Map(rowsA.map(r => [keyOf(r), r]));
+      const mapB = new Map(rowsB.map(r => [keyOf(r), r]));
+      const keys = new Set([...mapA.keys(), ...mapB.keys()]);
+
+      const changes = [...keys].map(k => {
+        const ra = mapA.get(k); const rb = mapB.get(k);
+        const posA = ra?.position ?? null; const posB = rb?.position ?? null;
+        return {
+          key: k,
+          clicks: { a: ra?.clicks ?? 0, b: rb?.clicks ?? 0, delta: (rb?.clicks ?? 0) - (ra?.clicks ?? 0) },
+          impressions: { a: ra?.impressions ?? 0, b: rb?.impressions ?? 0, delta: (rb?.impressions ?? 0) - (ra?.impressions ?? 0) },
+          position: { a: posA, b: posB, delta: (posA != null && posB != null) ? Number((posB - posA).toFixed(1)) : null },
+        };
+      });
+      changes.sort((x, y) => Math.abs(y.clicks.delta) - Math.abs(x.clicks.delta));
+      result.totalKeys = keys.size;
+      result.topChanges = changes.slice(0, topN);
+    }
+
+    return result;
+  }
+
+  /**
+   * Aggregates rows into period totals. Position is impression-weighted (the
+   * standard aggregate for Search Console position).
+   */
+  private aggregateTotals(rows: SearchAnalyticsRow[]): PeriodTotals {
+    let clicks = 0, impressions = 0, weightedPos = 0;
+    for (const r of rows) {
+      clicks += r.clicks ?? 0;
+      impressions += r.impressions ?? 0;
+      weightedPos += (r.position ?? 0) * (r.impressions ?? 0);
+    }
+    return {
+      clicks,
+      impressions,
+      ctr: impressions > 0 ? Number(((clicks / impressions) * 100).toFixed(2)) : 0,
+      position: impressions > 0 ? Number((weightedPos / impressions).toFixed(1)) : 0,
+    };
   }
 
   /**
@@ -242,14 +410,6 @@ export class SearchConsoleService {
     if (options.regexFilter) {
       validateRegex(options.regexFilter);
     }
-    
-    // Warn about large rowLimit values
-    if (requestBody.rowLimit && requestBody.rowLimit > 10000) {
-      console.error(
-        `⚠️  Large rowLimit (${requestBody.rowLimit}). This may take longer and consume more quota. ` +
-        `Consider pagination with startRow for very large datasets.`
-      );
-    }
 
     // Clone request body to avoid mutation
     const enhancedRequestBody = { ...requestBody };
@@ -269,11 +429,9 @@ export class SearchConsoleService {
       ];
     }
 
-    // Execute search analytics query
     const result = await this.searchAnalytics(siteUrl, enhancedRequestBody);
     const rows = (result.data.rows || []) as SearchAnalyticsRow[];
 
-    // Build enhanced response
     const enhancedResponse: EnhancedSearchAnalyticsResponse = {
       rows,
       responseAggregationType: result.data.responseAggregationType ?? undefined,
@@ -285,7 +443,14 @@ export class SearchConsoleService {
       },
     };
 
-    // Apply quick wins detection if enabled
+    // Surface API data-freshness metadata (firstIncompleteHour for hourly, etc.)
+    if (result.data.metadata) {
+      enhancedResponse.apiMetadata = {
+        firstIncompleteDate: result.data.metadata.firstIncompleteDate,
+        firstIncompleteHour: result.data.metadata.firstIncompleteHour,
+      };
+    }
+
     if (options.enableQuickWins && rows.length > 0) {
       enhancedResponse.quickWins = this.detectQuickWins(rows, options.quickWinsThresholds);
     }
@@ -404,7 +569,7 @@ export class SearchConsoleService {
    * Lists all sites accessible by the authenticated user
    */
   async listSites() {
-    const webmasters = await this.getWebmasters();
+    const webmasters = await this.getClient();
     return webmasters.sites.list();
   }
 
@@ -416,7 +581,7 @@ export class SearchConsoleService {
    * Lists sitemaps for a site
    */
   async listSitemaps(request: ListSitemapsRequest) {
-    const webmasters = await this.getWebmasters();
+    const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
       () => webmasters.sitemaps.list(request),
@@ -432,7 +597,7 @@ export class SearchConsoleService {
    * Gets details for a specific sitemap
    */
   async getSitemap(request: GetSitemapRequest) {
-    const webmasters = await this.getWebmasters();
+    const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
       () => webmasters.sitemaps.get(request),
@@ -454,7 +619,7 @@ export class SearchConsoleService {
       throw new Error('Write access required to submit sitemaps. Initialize service with writeAccess: true');
     }
 
-    const webmasters = await this.getWebmasters();
+    const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
       () => webmasters.sitemaps.submit(request),
@@ -476,7 +641,7 @@ export class SearchConsoleService {
       throw new Error('Write access required to delete sitemaps. Initialize service with writeAccess: true');
     }
 
-    const webmasters = await this.getWebmasters();
+    const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
       () => webmasters.sitemaps.delete(request),
@@ -498,77 +663,101 @@ export class SearchConsoleService {
    * @see https://developers.google.com/webmaster-tools/v1/urlInspection.index/inspect
    */
   async indexInspect(requestBody: IndexInspectRequest) {
-    // Validate inputs
     if (requestBody?.siteUrl) {
       validateSiteUrl(requestBody.siteUrl);
     }
     
-    // Track quota
     const quotaWarning = this.quotaTracker.recordUrlInspection();
     if (quotaWarning) {
       console.error(quotaWarning);
     }
     
-    const searchConsole = await this.getSearchConsole();
+    const searchConsole = await this.getClient();
 
-    try {
-      return await searchConsole.urlInspection.index.inspect({ requestBody });
-    } catch (err) {
-      throw parseGoogleApiError(err);
-    }
+    // Retry with the normalized sc-domain siteUrl on a permission error, matching
+    // searchAnalytics (a URL-prefix siteUrl against a domain property would fail).
+    return this.withPermissionFallback(
+      () => searchConsole.urlInspection.index.inspect({ requestBody }),
+      () => searchConsole.urlInspection.index.inspect({
+        requestBody: { ...requestBody, siteUrl: this.normalizeUrl(requestBody!.siteUrl!) },
+      }),
+      'indexInspect',
+    );
   }
 
   // ==========================================================================
   // Sitemap URL Fetching
   // ==========================================================================
 
+  /** Max child sitemaps to follow from a sitemap index, fetched concurrently. */
+  private static readonly MAX_CHILD_SITEMAPS = 50;
+
+  /**
+   * Fetches a URL and returns its text, transparently gunzipping `.gz` responses.
+   * Returns null on any failure (non-OK, timeout, network error).
+   */
+  private async fetchText(url: string): Promise<string | null> {
+    try {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!resp.ok) return null;
+      if (url.endsWith('.gz')) {
+        return gunzipSync(Buffer.from(await resp.arrayBuffer())).toString('utf-8');
+      }
+      return await resp.text();
+    } catch {
+      return null;
+    }
+  }
+
+  /** Extracts <loc> values from sitemap XML. */
+  private extractLocs(xml: string): string[] {
+    return [...xml.matchAll(/<loc>\s*(https?:\/\/[^<\s]+)\s*<\/loc>/g)].map(m => m[1].trim());
+  }
+
   /**
    * Fetches and parses sitemap URLs for a given site.
-   * Tries common sitemap paths and handles sitemap indexes.
+   *
+   * Discovers sitemaps from robots.txt (Sitemap: directives) plus common paths,
+   * follows a sitemap index (capped, concurrent child fetches), and handles
+   * gzipped sitemaps.
    */
   async fetchSitemapUrls(siteUrl: string): Promise<string[]> {
     const domain = siteUrl.startsWith('sc-domain:')
       ? siteUrl.replace('sc-domain:', '')
       : (() => { try { return new URL(siteUrl).hostname; } catch { return siteUrl; } })();
 
-    const sitemapPaths = [
-      `https://${domain}/sitemap.xml`,
-      `https://${domain}/sitemap_index.xml`,
-      `https://www.${domain}/sitemap.xml`,
-    ];
+    // Candidate sitemap URLs: robots.txt Sitemap: directives first, then common paths.
+    const candidates = new Set<string>();
+    const robots = await this.fetchText(`https://${domain}/robots.txt`);
+    if (robots) {
+      for (const m of robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)) candidates.add(m[1].trim());
+    }
+    candidates.add(`https://${domain}/sitemap.xml`);
+    candidates.add(`https://${domain}/sitemap_index.xml`);
+    candidates.add(`https://www.${domain}/sitemap.xml`);
 
-    for (const url of sitemapPaths) {
-      try {
-        const response = await fetch(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
-          signal: AbortSignal.timeout(15000),
-        });
-        if (!response.ok) continue;
-        const xml = await response.text();
+    for (const url of candidates) {
+      const xml = await this.fetchText(url);
+      if (!xml) continue;
 
-        // Check for sitemap index
-        const sitemapIndexMatches = [...xml.matchAll(/<sitemap>\s*<loc>\s*(.*?)\s*<\/loc>/gs)];
-        if (sitemapIndexMatches.length > 0) {
-          const allUrls: string[] = [];
-          for (const match of sitemapIndexMatches) {
-            try {
-              const childResp = await fetch(match[1].trim(), {
-                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
-                signal: AbortSignal.timeout(15000),
-              });
-              if (!childResp.ok) continue;
-              const childXml = await childResp.text();
-              const locs = [...childXml.matchAll(/<loc>\s*(https?:\/\/[^<\s]+)\s*<\/loc>/g)];
-              allUrls.push(...locs.map(m => m[1].trim()));
-            } catch { /* skip */ }
-          }
-          if (allUrls.length > 0) return allUrls;
+      // Sitemap index: follow child sitemaps (capped, concurrent).
+      const childLocs = [...xml.matchAll(/<sitemap>\s*<loc>\s*(.*?)\s*<\/loc>/gs)].map(m => m[1].trim());
+      if (childLocs.length > 0) {
+        if (childLocs.length > SearchConsoleService.MAX_CHILD_SITEMAPS) {
+          console.error(`[GSC] Sitemap index has ${childLocs.length} child sitemaps; fetching the first ${SearchConsoleService.MAX_CHILD_SITEMAPS}.`);
         }
+        const children = childLocs.slice(0, SearchConsoleService.MAX_CHILD_SITEMAPS);
+        const results = await Promise.all(children.map(c => this.fetchText(c)));
+        const allUrls = results.flatMap(cx => (cx ? this.extractLocs(cx) : []));
+        if (allUrls.length > 0) return allUrls;
+      }
 
-        // Regular sitemap
-        const locs = [...xml.matchAll(/<loc>\s*(https?:\/\/[^<\s]+)\s*<\/loc>/g)];
-        if (locs.length > 0) return locs.map(m => m[1].trim());
-      } catch { /* try next */ }
+      // Regular sitemap.
+      const locs = this.extractLocs(xml);
+      if (locs.length > 0) return locs;
     }
 
     return [];
@@ -587,7 +776,6 @@ export class SearchConsoleService {
     maxUrls: number,
     languageCode: string,
   ) {
-    // Validate inputs
     validateSiteUrl(siteUrl);
     if (urls) {
       validateArrayLength(urls, 500, 'urls');
@@ -655,44 +843,59 @@ export class SearchConsoleService {
    * Cross-references sitemap URLs with search analytics to find coverage gaps
    */
   async coverageReport(siteUrl: string, startDate: string, endDate: string) {
-    // Validate inputs
     validateSiteUrl(siteUrl);
     validateDateRange(startDate, endDate);
     
+    // Match on a normalized key (scheme-, www-, case-, trailing-slash-insensitive;
+    // query/hash ignored) so a sitemap URL and its analytics page URL line up even
+    // when they differ in those ways. Original URLs are kept for display.
+    const normKey = (u: string): string => {
+      try {
+        const url = new URL(u);
+        return url.hostname.toLowerCase().replace(/^www\./, '') + (url.pathname.replace(/\/+$/, '') || '/');
+      } catch {
+        return u.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '');
+      }
+    };
+
     const sitemapUrls = await this.fetchSitemapUrls(siteUrl);
-    const sitemapSet = new Set(sitemapUrls.map(u => u.replace(/\/$/, '')));
+    const sitemapMap = new Map<string, string>(); // normKey -> original url
+    for (const u of sitemapUrls) {
+      const k = normKey(u);
+      if (!sitemapMap.has(k)) sitemapMap.set(k, u);
+    }
 
     const analyticsResp = await this.searchAnalytics(siteUrl, {
       startDate, endDate, dimensions: ['page'], rowLimit: 25000, dataState: 'final',
     });
 
     const rows = analyticsResp.data.rows ?? [];
-    const analyticsMap = new Map<string, { clicks: number; impressions: number; position: number }>();
+    const analyticsMap = new Map<string, { url: string; clicks: number; impressions: number; position: number }>();
     for (const row of rows) {
-      const pageUrl = row.keys?.[0]?.replace(/\/$/, '');
-      if (pageUrl) analyticsMap.set(pageUrl, { clicks: row.clicks ?? 0, impressions: row.impressions ?? 0, position: row.position ?? 0 });
+      const pageUrl = row.keys?.[0];
+      if (pageUrl) analyticsMap.set(normKey(pageUrl), { url: pageUrl, clicks: row.clicks ?? 0, impressions: row.impressions ?? 0, position: row.position ?? 0 });
     }
 
     const inSitemapNoImpressions: Array<{ url: string }> = [];
     let overlap = 0;
-    for (const url of sitemapSet) {
-      if (analyticsMap.has(url)) overlap++;
+    for (const [key, url] of sitemapMap) {
+      if (analyticsMap.has(key)) overlap++;
       else inSitemapNoImpressions.push({ url });
     }
 
     const hasImpressionsNoSitemap: Array<{ url: string; clicks: number; impressions: number; position: number }> = [];
-    for (const [url, data] of analyticsMap) {
-      if (!sitemapSet.has(url)) hasImpressionsNoSitemap.push({ url, ...data });
+    for (const [key, data] of analyticsMap) {
+      if (!sitemapMap.has(key)) hasImpressionsNoSitemap.push({ url: data.url, clicks: data.clicks, impressions: data.impressions, position: data.position });
     }
     hasImpressionsNoSitemap.sort((a, b) => b.impressions - a.impressions);
 
     return {
-      sitemapUrls: sitemapSet.size,
+      sitemapUrls: sitemapMap.size,
       analyticsUrls: analyticsMap.size,
       inSitemapNoImpressions: inSitemapNoImpressions.slice(0, 100),
       hasImpressionsNoSitemap: hasImpressionsNoSitemap.slice(0, 100),
       overlap,
-      coveragePercent: sitemapSet.size > 0 ? Number(((overlap / sitemapSet.size) * 100).toFixed(1)) : 0,
+      coveragePercent: sitemapMap.size > 0 ? Number(((overlap / sitemapMap.size) * 100).toFixed(1)) : 0,
     };
   }
 
@@ -704,7 +907,6 @@ export class SearchConsoleService {
    * Inspects URLs and extracts rich results data and issues
    */
   async richResultsCheck(siteUrl: string, urls: string[] | undefined, maxUrls: number, languageCode: string) {
-    // Validate inputs
     validateSiteUrl(siteUrl);
     if (urls) {
       validateArrayLength(urls, 500, 'urls');
