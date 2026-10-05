@@ -69,9 +69,12 @@ test('comparePeriods computes totals, deltas, and top movers', async () => {
     { startDate: '2026-01-01', endDate: '2026-01-31', dimensions: ['query'] }, 25);
   assert.equal(c.periodA.totals.clicks, 15);
   assert.equal(c.periodA.totals.position, 7); // impression-weighted
-  assert.equal(c.delta.clicks.abs, 8);
-  assert.equal(c.delta.clicks.pct, 53.3);
+  // Deltas are primary minus comparison: Feb (15) vs Jan (23) is a decline.
+  assert.equal(c.delta.clicks.abs, -8);
+  assert.equal(c.delta.clicks.pct, -34.8);
+  assert.equal(c.delta.position.abs, 1.5); // 7 vs 5.5: numerically worse
   assert.equal(c.topChanges[0].key, 'a');
+  assert.equal(c.topChanges[0].clicks.delta, -10);
   assert.equal(c.totalKeys, 3);
 });
 
