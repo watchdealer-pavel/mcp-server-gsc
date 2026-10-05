@@ -325,14 +325,15 @@ export class SearchConsoleService {
     const totalsB = this.aggregateTotals(((hasDims ? tb! : b).data.rows || []) as SearchAnalyticsRow[]);
     const pct = (from: number, to: number) => from === 0 ? (to === 0 ? 0 : null) : Number((((to - from) / from) * 100).toFixed(1));
 
+    // Deltas are primary (A) minus comparison (B): positive clicks = growth in the primary period.
     const result: PeriodComparison = {
       periodA: { startDate: requestBodyA?.startDate ?? null, endDate: requestBodyA?.endDate ?? null, totals: totalsA },
       periodB: { startDate: requestBodyB?.startDate ?? null, endDate: requestBodyB?.endDate ?? null, totals: totalsB },
       delta: {
-        clicks: { abs: totalsB.clicks - totalsA.clicks, pct: pct(totalsA.clicks, totalsB.clicks) },
-        impressions: { abs: totalsB.impressions - totalsA.impressions, pct: pct(totalsA.impressions, totalsB.impressions) },
-        ctr: { abs: Number((totalsB.ctr - totalsA.ctr).toFixed(2)) },
-        position: { abs: Number((totalsB.position - totalsA.position).toFixed(1)) },
+        clicks: { abs: totalsA.clicks - totalsB.clicks, pct: pct(totalsB.clicks, totalsA.clicks) },
+        impressions: { abs: totalsA.impressions - totalsB.impressions, pct: pct(totalsB.impressions, totalsA.impressions) },
+        ctr: { abs: Number((totalsA.ctr - totalsB.ctr).toFixed(2)) },
+        position: { abs: Number((totalsA.position - totalsB.position).toFixed(1)) },
       },
     };
 
@@ -349,9 +350,9 @@ export class SearchConsoleService {
         const posA = ra?.position ?? null; const posB = rb?.position ?? null;
         return {
           key: k,
-          clicks: { a: ra?.clicks ?? 0, b: rb?.clicks ?? 0, delta: (rb?.clicks ?? 0) - (ra?.clicks ?? 0) },
-          impressions: { a: ra?.impressions ?? 0, b: rb?.impressions ?? 0, delta: (rb?.impressions ?? 0) - (ra?.impressions ?? 0) },
-          position: { a: posA, b: posB, delta: (posA != null && posB != null) ? Number((posB - posA).toFixed(1)) : null },
+          clicks: { a: ra?.clicks ?? 0, b: rb?.clicks ?? 0, delta: (ra?.clicks ?? 0) - (rb?.clicks ?? 0) },
+          impressions: { a: ra?.impressions ?? 0, b: rb?.impressions ?? 0, delta: (ra?.impressions ?? 0) - (rb?.impressions ?? 0) },
+          position: { a: posA, b: posB, delta: (posA != null && posB != null) ? Number((posA - posB).toFixed(1)) : null },
         };
       });
       changes.sort((x, y) => Math.abs(y.clicks.delta) - Math.abs(x.clicks.delta));

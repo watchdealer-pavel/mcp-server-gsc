@@ -64,6 +64,12 @@ test('server boots on stdio and lists all 15 tools', async () => {
 
     const names = resp.result.tools.map((t) => t.name).sort();
     assert.deepEqual(names, EXPECTED_TOOLS);
+    // Fields with defaults must stay optional for clients that validate against the schema.
+    const compare = resp.result.tools.find((t) => t.name === 'compare_periods');
+    assert.deepEqual(compare.inputSchema.required.sort(),
+      ['compareEndDate', 'compareStartDate', 'endDate', 'siteUrl', 'startDate']);
+    // ...while unknown (e.g. misspelled) arguments are still rejected by validating clients.
+    for (const t of resp.result.tools) assert.equal(t.inputSchema.additionalProperties, false, t.name);
   } finally {
     proc.kill();
   }

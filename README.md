@@ -149,7 +149,7 @@ Tool: compare_periods
   dimensions: "query"
 ```
 
-Returns totals for both periods, the deltas and percentage change, and the queries that moved the most.
+Returns totals for both periods, the deltas and percentage change, and the queries that moved the most. Deltas are the primary period (`startDate`/`endDate`) minus the comparison period, so a positive click delta means growth.
 
 ### Search analytics with regex
 
