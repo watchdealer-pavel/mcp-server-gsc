@@ -30,7 +30,7 @@ import { SearchConsoleService } from './search-console.js';
 
 const SERVER_NAME = 'gsc-mcp-server';
 // Keep in sync with "version" in package.json
-const SERVER_VERSION = '0.5.0';
+const SERVER_VERSION = '0.6.0';
 
 // ============================================================================
 // Environment & Service Initialization
@@ -159,83 +159,96 @@ const server = new Server(
 // Tool Definitions
 // ============================================================================
 
+// Advertise the input shape, so arguments with defaults stay optional, while still
+// rejecting unknown keys: a misspelled filter should fail, not be silently dropped.
+function toolSchema(schema: z.ZodType) {
+  return z.toJSONSchema(schema, {
+    io: 'input',
+    override: (ctx) => {
+      if (ctx.jsonSchema.type === 'object' && ctx.jsonSchema.additionalProperties === undefined) {
+        ctx.jsonSchema.additionalProperties = false;
+      }
+    },
+  });
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: 'list_sites',
         description: 'List all sites you have access to in Google Search Console',
-        inputSchema: z.toJSONSchema(z.object({}), { io: 'input' }),
+        inputSchema: toolSchema(z.object({})),
       },
       {
         name: 'search_analytics',
         description: 'Query search performance data (clicks, impressions, CTR, position) from Google Search Console',
-        inputSchema: z.toJSONSchema(SearchAnalyticsSchema, { io: 'input' }),
+        inputSchema: toolSchema(SearchAnalyticsSchema),
       },
       {
         name: 'enhanced_search_analytics',
         description: 'Advanced search analytics with up to 25,000 rows, regex filters, data freshness control, and optional quick wins detection',
-        inputSchema: z.toJSONSchema(EnhancedSearchAnalyticsSchema, { io: 'input' }),
+        inputSchema: toolSchema(EnhancedSearchAnalyticsSchema),
       },
       {
         name: 'search_analytics_all',
         description: 'Fetch search analytics beyond the 25,000-row-per-request cap by auto-paginating (up to 50,000 rows; the API caps data at ~50k/day per property per search type)',
-        inputSchema: z.toJSONSchema(SearchAnalyticsAllSchema, { io: 'input' }),
+        inputSchema: toolSchema(SearchAnalyticsAllSchema),
       },
       {
         name: 'compare_periods',
-        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions',
-        inputSchema: z.toJSONSchema(ComparePeriodsSchema, { io: 'input' }),
+        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth.',
+        inputSchema: toolSchema(ComparePeriodsSchema),
       },
       {
         name: 'get_quota_status',
         description: 'Report current API quota usage this process is tracking (Search Analytics per-minute; URL Inspection per-minute and per-day, per site)',
-        inputSchema: z.toJSONSchema(z.object({}), { io: 'input' }),
+        inputSchema: toolSchema(z.object({})),
       },
       {
         name: 'detect_quick_wins',
         description: 'Analyze search data to find SEO quick wins - keywords with high impressions but low CTR that could benefit from optimization',
-        inputSchema: z.toJSONSchema(QuickWinsDetectionSchema, { io: 'input' }),
+        inputSchema: toolSchema(QuickWinsDetectionSchema),
       },
       {
         name: 'index_inspect',
         description: 'Inspect a URL to check its indexing status, crawl info, and any issues preventing indexing',
-        inputSchema: z.toJSONSchema(IndexInspectSchema, { io: 'input' }),
+        inputSchema: toolSchema(IndexInspectSchema),
       },
       {
         name: 'list_sitemaps',
         description: 'List all sitemaps submitted for a site in Google Search Console',
-        inputSchema: z.toJSONSchema(ListSitemapsSchema, { io: 'input' }),
+        inputSchema: toolSchema(ListSitemapsSchema),
       },
       {
         name: 'get_sitemap',
         description: 'Get detailed information about a specific sitemap including status and error counts',
-        inputSchema: z.toJSONSchema(GetSitemapSchema, { io: 'input' }),
+        inputSchema: toolSchema(GetSitemapSchema),
       },
       {
         name: 'submit_sitemap',
         description: 'Submit a new sitemap to Google Search Console for crawling',
-        inputSchema: z.toJSONSchema(SubmitSitemapSchema, { io: 'input' }),
+        inputSchema: toolSchema(SubmitSitemapSchema),
       },
       {
         name: 'delete_sitemap',
         description: 'Delete a sitemap from Google Search Console',
-        inputSchema: z.toJSONSchema(DeleteSitemapSchema, { io: 'input' }),
+        inputSchema: toolSchema(DeleteSitemapSchema),
       },
       {
         name: 'batch_inspect',
         description: 'Inspect multiple URLs in batch, grouping results by indexing verdict (PASS/FAIL/PARTIAL). Fetches URLs from sitemap if not provided.',
-        inputSchema: z.toJSONSchema(BatchInspectSchema, { io: 'input' }),
+        inputSchema: toolSchema(BatchInspectSchema),
       },
       {
         name: 'coverage_report',
         description: 'Cross-reference sitemap URLs with search analytics to find unindexed pages and orphaned URLs not in sitemap',
-        inputSchema: z.toJSONSchema(CoverageReportSchema, { io: 'input' }),
+        inputSchema: toolSchema(CoverageReportSchema),
       },
       {
         name: 'rich_results_check',
         description: 'Inspect URLs for rich results (structured data) issues and detected item types',
-        inputSchema: z.toJSONSchema(RichResultsCheckSchema, { io: 'input' }),
+        inputSchema: toolSchema(RichResultsCheckSchema),
       },
     ],
   };
