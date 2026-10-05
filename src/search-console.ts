@@ -299,9 +299,14 @@ export class SearchConsoleService {
    * Compares two date ranges: per-period totals plus deltas, and — when
    * dimensions are supplied — per-key differences for the biggest movers.
    *
-   * Totals come from a separate dimensionless query per period. Summing
-   * dimension rows would understate them badly, because a grouped query is
-   * capped at rowLimit and GSC omits anonymized long-tail queries entirely.
+   * Totals come from a separate date-grouped query per period (hour-grouped
+   * for dataState "hourly_all", the only grouping the API accepts there).
+   * Summing the caller's dimension rows would understate them badly, because a
+   * grouped query is capped at rowLimit and GSC omits anonymized long-tail
+   * queries entirely. Grouping by date gives the same totals and shows which
+   * days have data: each period reports `dataThrough`, and `warnings` flags a
+   * period whose totals are not comparable (unfinalized days missing under
+   * "final", partial days included under "all", or no data at all).
    */
   async comparePeriods(
     siteUrl: string,
@@ -315,7 +320,8 @@ export class SearchConsoleService {
     // period gives accurate totals (keeping any filters) and shows which days have
     // data. dataState "final" silently omits the last ~2-3 unfinalized days, so a
     // window ending near today would otherwise compare a partial week to a full one.
-    const byDate = (r: SearchAnalyticsQueryRequest) => ({ ...r, dimensions: ['date'], rowLimit: 25000, startRow: 0 });
+    const byDate = (r: SearchAnalyticsQueryRequest) =>
+      ({ ...r, dimensions: [r?.dataState === 'hourly_all' ? 'hour' : 'date'], rowLimit: 25000, startRow: 0 });
     const [a, b, ta, tb] = await Promise.all([
       hasDims ? this.searchAnalytics(siteUrl, requestBodyA) : Promise.resolve(null),
       hasDims ? this.searchAnalytics(siteUrl, requestBodyB) : Promise.resolve(null),
@@ -331,19 +337,15 @@ export class SearchConsoleService {
     const totalsB = this.aggregateTotals(dailyB);
     const pct = (from: number, to: number) => from === 0 ? (to === 0 ? 0 : null) : Number((((to - from) / from) * 100).toFixed(1));
 
-    // Last day with data; ISO dates compare correctly as strings.
+    // Last day with data (hour keys start with their date); ISO dates compare correctly as strings.
     const dataThrough = (rows: SearchAnalyticsRow[]) =>
-      rows.reduce<string | null>((max, r) => { const d = r.keys?.[0] ?? null; return d && (!max || d > max) ? d : max; }, null);
+      rows.reduce<string | null>((max, r) => { const d = r.keys?.[0]?.slice(0, 10) ?? null; return d && (!max || d > max) ? d : max; }, null);
     const throughA = dataThrough(dailyA);
     const throughB = dataThrough(dailyB);
-    const warnings: string[] = [];
-    for (const [name, body, through] of [['periodA', requestBodyA, throughA], ['periodB', requestBodyB, throughB]] as const) {
-      if (body?.endDate && (!through || through < body.endDate)) {
-        warnings.push(`${name} has no data after ${through ?? 'its start'} (requested through ${body.endDate}). `
-          + `With dataState "final" the most recent ~2-3 days are not finalized yet, so totals and deltas cover unequal `
-          + `day counts: end both periods on or before the last finalized day.`);
-      }
-    }
+    const warnings = [
+      this.periodWarning('periodA', requestBodyA, dailyA, throughA, ta.data.metadata),
+      this.periodWarning('periodB', requestBodyB, dailyB, throughB, tb.data.metadata),
+    ].filter((w): w is string => w !== null);
 
     // Deltas are primary (A) minus comparison (B): positive clicks = growth in the primary period.
     const result: PeriodComparison = {
@@ -382,6 +384,45 @@ export class SearchConsoleService {
     }
 
     return result;
+  }
+
+  /**
+   * Why a period's totals are not comparable, or null. Quiet days come back as
+   * zero-impression rows, so a period that stops early is genuinely missing days.
+   */
+  private periodWarning(
+    name: string,
+    body: SearchAnalyticsQueryRequest | undefined,
+    rows: SearchAnalyticsRow[],
+    through: string | null,
+    metadata: { firstIncompleteDate?: string | null; firstIncompleteHour?: string | null } | null | undefined,
+  ): string | null {
+    const start = body?.startDate;
+    const end = body?.endDate;
+    if (!start || !end) return null;
+    const state = body?.dataState ?? 'final';
+    if (!through) {
+      return `${name} returned no data for ${start}..${end} (future dates, older than the 16-month retention, or no traffic), `
+        + `so its totals are 0 and deltas against it are meaningless.`;
+    }
+    if (state === 'all' || state === 'hourly_all') {
+      const incomplete = metadata?.firstIncompleteDate ?? metadata?.firstIncompleteHour?.slice(0, 10) ?? null;
+      if (incomplete && incomplete <= end) {
+        return `${name} includes ${incomplete} onward, which Search Console is still collecting (dataState "${state}"), `
+          + `so its latest days are undercounted. For a fair comparison use dataState "final" with both periods ending before ${incomplete}.`;
+      }
+      return null;
+    }
+    if (through < end) {
+      const days = (from: string, to: string) => Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 864e5) + 1;
+      const requested = days(start, end);
+      const have = new Set(rows.map(r => r.keys?.[0]?.slice(0, 10))).size;
+      const gap = days(through, end) - 1;
+      return `${name} has finalized data only through ${through} (${have} of ${requested} requested days): Search Console `
+        + `finalizes data ~2-3 days late, so totals and deltas cover unequal spans. To compare like with like, shift both `
+        + `periods back ${gap} day(s) so ${name} ends on ${through} (this keeps weekdays aligned).`;
+    }
+    return null;
   }
 
   /**

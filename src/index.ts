@@ -197,7 +197,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'compare_periods',
-        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth. Each period reports dataThrough (last date with data); if the response has warnings, a period is missing its final days (dataState "final" lags ~2-3 days) and the totals are not comparable — end both periods on or before the last finalized day.',
+        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth. Each period reports dataThrough (last date with data); if the response has warnings, a period\'s totals are not comparable (missing unfinalized days under dataState "final", partial days under "all", or no data); follow the warning\'s advice and re-run. Do not switch to dataState "all" to avoid the warning: it includes partial recent days and is flagged too.',
         inputSchema: toolSchema(ComparePeriodsSchema),
       },
       {

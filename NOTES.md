@@ -149,6 +149,16 @@ API's own figure on live data (8.8 both ways). Each period reports `dataThrough`
 The response carries `warnings` when a period has no data after a date before its
 `endDate`. The API call count is unchanged: 2 calls without dimensions, 4 with.
 
+Review follow-ups (same release): `dataState: "all"` includes partial recent days and
+was never flagged, which an LLM could reach by "fixing" the final-lag warning; it now
+warns when the totals query's `metadata.firstIncompleteDate` falls inside a period
+(free, since that query is date-grouped). Warnings name the actual cause, give the
+observed day count and say how far to shift both periods; an empty period is flagged.
+Verified live: quiet days return zero-impression rows (no false positives), and totals
+match the old dimensionless query to the decimal with page, country and query filters,
+`byPage` and Discover. `hourly_all` failed on every call before (the API accepts only
+hour grouping there); totals now group by hour for it.
+
 ## Future work (deferred, not done in this pass)
 
 - [ ] Fuller test coverage (validators, quota-tracker, quick-wins math). A boot plus `tools/list` smoke test already lives at `test/smoke.test.mjs` (`npm test`).
