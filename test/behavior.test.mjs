@@ -57,16 +57,24 @@ test('detectQuickWins picks qualifying rows and computes value', async () => {
 
 test('comparePeriods computes totals, deltas, and top movers', async () => {
   const svc = new SearchConsoleService('/tmp/dummy.json', true);
-  // Key off the request's startDate so both the grouped and the dimensionless
+  // Key off the request's startDate so both the grouped and the date-grouped
   // totals query for a period return that period's data.
   svc.searchAnalytics = async (_s, body) => {
-    return body.startDate === '2026-02-01'
+    const feb = body.startDate === '2026-02-01';
+    if (body.dimensions[0] === 'date') {
+      return feb
+        ? { data: { rows: [{ keys: ['2026-02-01'], clicks: 10, impressions: 100, position: 5 }, { keys: ['2026-02-28'], clicks: 5, impressions: 200, position: 8 }] } }
+        : { data: { rows: [{ keys: ['2026-01-01'], clicks: 20, impressions: 120, position: 4 }, { keys: ['2026-01-31'], clicks: 3, impressions: 50, position: 9 }] } };
+    }
+    return feb
       ? { data: { rows: [{ keys: ['a'], clicks: 10, impressions: 100, ctr: 0.1, position: 5 }, { keys: ['b'], clicks: 5, impressions: 200, ctr: 0.025, position: 8 }] } }
       : { data: { rows: [{ keys: ['a'], clicks: 20, impressions: 120, ctr: 0.167, position: 4 }, { keys: ['c'], clicks: 3, impressions: 50, ctr: 0.06, position: 9 }] } };
   };
   const c = await svc.comparePeriods('sc-domain:x',
     { startDate: '2026-02-01', endDate: '2026-02-28', dimensions: ['query'] },
     { startDate: '2026-01-01', endDate: '2026-01-31', dimensions: ['query'] }, 25);
+  assert.equal(c.warnings, undefined); // both periods have data through their end dates
+  assert.equal(c.periodA.dataThrough, '2026-02-28');
   assert.equal(c.periodA.totals.clicks, 15);
   assert.equal(c.periodA.totals.position, 7); // impression-weighted
   // Deltas are primary minus comparison: Feb (15) vs Jan (23) is a decline.
@@ -76,6 +84,90 @@ test('comparePeriods computes totals, deltas, and top movers', async () => {
   assert.equal(c.topChanges[0].key, 'a');
   assert.equal(c.topChanges[0].clicks.delta, -10);
   assert.equal(c.totalKeys, 3);
+});
+
+// Daily rows for [startDate, startDate + days), as the date-grouped totals query returns them.
+// Quiet days come back as zero-impression rows (verified live), not as missing rows.
+const dailyRows = (startDate, days, { quietLast = false } = {}) => {
+  const day0 = new Date(startDate + 'T00:00:00Z');
+  return Array.from({ length: days }, (_, i) => ({
+    keys: [new Date(day0.getTime() + i * 864e5).toISOString().slice(0, 10)],
+    clicks: quietLast && i === days - 1 ? 0 : 10,
+    impressions: quietLast && i === days - 1 ? 0 : 100,
+    position: 8,
+  }));
+};
+const comparator = (rowsFor, metadataFor = () => undefined) => {
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  const calls = [];
+  svc.searchAnalytics = async (_s, body) => { calls.push(body); return { data: { rows: rowsFor(body), metadata: metadataFor(body) } }; };
+  return { svc, calls };
+};
+const week = (startDate, endDate, extra = {}) => ({ startDate, endDate, dataState: 'final', ...extra });
+
+test('comparePeriods totals queries keep every filter and option, grouped only by date', async () => {
+  const extra = { type: 'web', aggregationType: 'byPage', dimensionFilterGroups: [{ filters: [{ dimension: 'country', operator: 'equals', expression: 'deu' }] }] };
+  const reqA = week('2026-09-21', '2026-09-27', { ...extra, dimensions: ['query'], rowLimit: 1000 });
+  const reqB = week('2026-09-14', '2026-09-20', { ...extra, dimensions: ['query'], rowLimit: 1000 });
+  const { svc, calls } = comparator(b => (b.dimensions[0] === 'date' ? dailyRows(b.startDate, 7) : []));
+  await svc.comparePeriods('sc-domain:x', reqA, reqB, 25);
+  assert.equal(calls.length, 4); // grouped A/B for movers + date-grouped A/B for totals
+  assert.deepEqual(calls[0], reqA);
+  assert.deepEqual(calls[1], reqB);
+  assert.deepEqual(calls[2], { ...reqA, dimensions: ['date'], rowLimit: 25000, startRow: 0 });
+  assert.deepEqual(calls[3], { ...reqB, dimensions: ['date'], rowLimit: 25000, startRow: 0 });
+});
+
+test('comparePeriods warns when a "final" period is missing its unfinalized last days', async () => {
+  // Regression: a "final" week ending yesterday returned only 5 of 7 days, so a
+  // flat week was reported as a -40% click drop with no indication why.
+  const { svc, calls } = comparator(b => dailyRows(b.startDate, b.startDate === '2026-09-28' ? 5 : 7));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-09-28', '2026-10-04'), week('2026-09-21', '2026-09-27'), 25);
+  assert.deepEqual(calls.map(b => b.dimensions), [['date'], ['date']]); // no dimensions: totals queries only
+  assert.equal(c.periodA.dataThrough, '2026-10-02');
+  assert.equal(c.periodB.dataThrough, '2026-09-27');
+  assert.equal(c.delta.clicks.abs, -20);
+  assert.equal(c.warnings.length, 1);
+  assert.match(c.warnings[0], /^periodA has finalized data only through 2026-10-02 \(5 of 7 requested days\)/);
+  assert.match(c.warnings[0], /shift both periods back 2 day\(s\)/);
+});
+
+test('comparePeriods does not warn when the last day was merely quiet (zero-impression row)', async () => {
+  const { svc } = comparator(b => dailyRows(b.startDate, 7, { quietLast: true }));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-09-21', '2026-09-27'), week('2026-09-14', '2026-09-20'), 25);
+  assert.equal(c.periodA.dataThrough, '2026-09-27');
+  assert.equal(c.warnings, undefined);
+});
+
+test('comparePeriods warns when a period returned no data at all', async () => {
+  const { svc } = comparator(b => (b.startDate === '2020-01-01' ? [] : dailyRows(b.startDate, 7)));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-09-21', '2026-09-27'), week('2020-01-01', '2020-01-07'), 25);
+  assert.equal(c.periodB.dataThrough, null);
+  assert.equal(c.warnings.length, 1);
+  assert.match(c.warnings[0], /^periodB returned no data for 2020-01-01\.\.2020-01-07/);
+  // Quiet days come back as zero rows, so "no traffic" is not a plausible cause; under
+  // "final" the likeliest one is a period entirely inside the unfinalized window.
+  assert.match(c.warnings[0], /none of its days are finalized yet/);
+  assert.doesNotMatch(c.warnings[0], /no traffic/);
+});
+
+test('comparePeriods warns that dataState "all" undercounts days still being collected', async () => {
+  // "all" returns rows through today, but the newest days are partial; Google reports
+  // where that starts in metadata.firstIncompleteDate (date-grouped queries only).
+  const { svc } = comparator(b => dailyRows(b.startDate, 8), b => (b.startDate === '2026-09-28' ? { firstIncompleteDate: '2026-10-04' } : undefined));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-09-28', '2026-10-05', { dataState: 'all' }), week('2026-09-20', '2026-09-27', { dataState: 'all' }), 25);
+  assert.equal(c.warnings.length, 1);
+  assert.match(c.warnings[0], /^periodA includes 2026-10-04 onward, which Search Console is still collecting \(dataState "all"\)/);
+  assert.match(c.warnings[0], /ending before 2026-10-04/);
+});
+
+test('comparePeriods groups hourly_all totals by hour (the API rejects date grouping there)', async () => {
+  const hours = (date) => Array.from({ length: 3 }, (_, h) => ({ keys: [`${date}T0${h}:00:00-07:00`], clicks: 1, impressions: 10, position: 5 }));
+  const { svc, calls } = comparator(b => hours(b.endDate));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-10-04', '2026-10-04', { dataState: 'hourly_all' }), week('2026-10-03', '2026-10-03', { dataState: 'hourly_all' }), 25);
+  assert.deepEqual(calls.map(b => b.dimensions), [['hour'], ['hour']]);
+  assert.equal(c.periodA.dataThrough, '2026-10-04');
+  assert.equal(c.periodA.totals.clicks, 3);
 });
 
 test('fetchSitemapUrls discovers via robots.txt and gunzips child sitemaps', async () => {

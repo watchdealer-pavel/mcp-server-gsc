@@ -135,6 +135,30 @@ Tested every tool against real Search Console data and fixed what the audit foun
 
 Regression guards for all of the above live in `test/behavior.test.mjs`.
 
+## compare_periods: truncated "final" periods (2026-10-05)
+
+A weekly report compared 28 Sep–4 Oct against 21–27 Sep with `dataState: "final"`
+and showed -40% clicks. Finalized data stopped at 2 Oct, so the primary period held
+5 days against 7. Per day, impressions were flat. Google documents
+`metadata.firstIncompleteDate` only for `dataState: "all"` grouped by date, so a
+`final` request gets no signal that it was cut short.
+
+Totals now come from a date-grouped query per period instead of a dimensionless
+one. The sum is the same and position is impression-weighted, which matched the
+API's own figure on live data (8.8 both ways). Each period reports `dataThrough`.
+The response carries `warnings` when a period has no data after a date before its
+`endDate`. The API call count is unchanged: 2 calls without dimensions, 4 with.
+
+Review follow-ups (same release): `dataState: "all"` includes partial recent days and
+was never flagged, which an LLM could reach by "fixing" the final-lag warning; it now
+warns when the totals query's `metadata.firstIncompleteDate` falls inside a period
+(free, since that query is date-grouped). Warnings name the actual cause, give the
+observed day count and say how far to shift both periods; an empty period is flagged.
+Verified live: quiet days return zero-impression rows (no false positives), and totals
+match the old dimensionless query to the decimal with page, country and query filters,
+`byPage` and Discover. `hourly_all` failed on every call before (the API accepts only
+hour grouping there); totals now group by hour for it.
+
 ## Future work (deferred, not done in this pass)
 
 - [ ] Fuller test coverage (validators, quota-tracker, quick-wins math). A boot plus `tools/list` smoke test already lives at `test/smoke.test.mjs` (`npm test`).

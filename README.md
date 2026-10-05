@@ -151,6 +151,14 @@ Tool: compare_periods
 
 Returns totals for both periods, the deltas and percentage change, and the queries that moved the most. Deltas are the primary period (`startDate`/`endDate`) minus the comparison period, so a positive click delta means growth.
 
+Each period also reports `dataThrough`, the last date that has data. Totals are only comparable when both periods cover the same number of days, and the response includes `warnings` when they don't:
+
+- With the default `dataState: "final"`, Google leaves out the most recent 2–3 days because they aren't finalized yet. A period that ends inside that window is cut short. The warning gives the day count (for example "6 of 7 requested days") and how far to shift both periods back so they stay aligned by weekday.
+- With `dataState: "all"`, the most recent days are included but still partial (Google's `firstIncompleteDate`). A period that includes them is undercounted, and the warning says to use `"final"` with both periods ending before that date. Switching to `"all"` is not a way around the first warning.
+- A period that returned no data at all is flagged too. Under `"final"` the usual cause is that every day in it is still unfinalized; otherwise it's future dates or dates older than the 16-month retention (quiet days don't cause it, since they return zero-impression rows).
+
+Quiet days come back as zero-impression rows rather than missing rows, so a low-traffic filter doesn't trigger a false warning. With `dataState: "hourly_all"`, totals are grouped by hour, the only grouping the API accepts for it.
+
 ### Search analytics with regex
 
 Filter queries by pattern, useful for topic-specific analysis:
