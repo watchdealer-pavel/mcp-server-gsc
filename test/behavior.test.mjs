@@ -145,6 +145,10 @@ test('comparePeriods warns when a period returned no data at all', async () => {
   assert.equal(c.periodB.dataThrough, null);
   assert.equal(c.warnings.length, 1);
   assert.match(c.warnings[0], /^periodB returned no data for 2020-01-01\.\.2020-01-07/);
+  // Quiet days come back as zero rows, so "no traffic" is not a plausible cause; under
+  // "final" the likeliest one is a period entirely inside the unfinalized window.
+  assert.match(c.warnings[0], /none of its days are finalized yet/);
+  assert.doesNotMatch(c.warnings[0], /no traffic/);
 });
 
 test('comparePeriods warns that dataState "all" undercounts days still being collected', async () => {

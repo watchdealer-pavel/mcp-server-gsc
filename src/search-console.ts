@@ -402,8 +402,13 @@ export class SearchConsoleService {
     if (!start || !end) return null;
     const state = body?.dataState ?? 'final';
     if (!through) {
-      return `${name} returned no data for ${start}..${end} (future dates, older than the 16-month retention, or no traffic), `
-        + `so its totals are 0 and deltas against it are meaningless.`;
+      // Quiet days come back as zero-impression rows, so an empty period is about dates, not traffic.
+      const why = state === 'final'
+        ? `Under dataState "final" this usually means none of its days are finalized yet (Search Console lags ~2-3 days); `
+          + `otherwise the dates are in the future or older than the 16-month retention.`
+        : `The dates are in the future or older than the 16-month retention.`;
+      return `${name} returned no data for ${start}..${end}. ${why} Its totals are 0 and deltas against it are meaningless: `
+        + `end both periods earlier.`;
     }
     if (state === 'all' || state === 'hourly_all') {
       const incomplete = metadata?.firstIncompleteDate ?? metadata?.firstIncompleteHour?.slice(0, 10) ?? null;
