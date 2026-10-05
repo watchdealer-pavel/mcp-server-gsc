@@ -135,6 +135,20 @@ Tested every tool against real Search Console data and fixed what the audit foun
 
 Regression guards for all of the above live in `test/behavior.test.mjs`.
 
+## compare_periods: truncated "final" periods (2026-10-05)
+
+A weekly report compared 28 Sep–4 Oct against 21–27 Sep with `dataState: "final"`
+and showed -40% clicks. Finalized data stopped at 2 Oct, so the primary period held
+5 days against 7. Per day, impressions were flat. Google documents
+`metadata.firstIncompleteDate` only for `dataState: "all"` grouped by date, so a
+`final` request gets no signal that it was cut short.
+
+Totals now come from a date-grouped query per period instead of a dimensionless
+one. The sum is the same and position is impression-weighted, which matched the
+API's own figure on live data (8.8 both ways). Each period reports `dataThrough`.
+The response carries `warnings` when a period has no data after a date before its
+`endDate`. The API call count is unchanged: 2 calls without dimensions, 4 with.
+
 ## Future work (deferred, not done in this pass)
 
 - [ ] Fuller test coverage (validators, quota-tracker, quick-wins math). A boot plus `tools/list` smoke test already lives at `test/smoke.test.mjs` (`npm test`).

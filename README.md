@@ -151,6 +151,8 @@ Tool: compare_periods
 
 Returns totals for both periods, the deltas and percentage change, and the queries that moved the most. Deltas are the primary period (`startDate`/`endDate`) minus the comparison period, so a positive click delta means growth.
 
+Each period also reports `dataThrough`, the last date that has data. With the default `dataState: "final"`, Google leaves out the most recent 2–3 days because they aren't finalized yet. A period that ends inside that window is cut short, and its totals then cover fewer days than the other period. When that happens the response includes `warnings`. End both periods on or before the last finalized day so they cover the same number of days.
+
 ### Search analytics with regex
 
 Filter queries by pattern, useful for topic-specific analysis:

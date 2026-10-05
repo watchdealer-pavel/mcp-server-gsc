@@ -30,7 +30,7 @@ import { SearchConsoleService } from './search-console.js';
 
 const SERVER_NAME = 'gsc-mcp-server';
 // Keep in sync with "version" in package.json
-const SERVER_VERSION = '0.6.0';
+const SERVER_VERSION = '0.7.0';
 
 // ============================================================================
 // Environment & Service Initialization
@@ -197,7 +197,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'compare_periods',
-        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth.',
+        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth. Each period reports dataThrough (last date with data); if the response has warnings, a period is missing its final days (dataState "final" lags ~2-3 days) and the totals are not comparable — end both periods on or before the last finalized day.',
         inputSchema: toolSchema(ComparePeriodsSchema),
       },
       {
