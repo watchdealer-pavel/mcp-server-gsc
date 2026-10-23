@@ -347,15 +347,63 @@ test('enhancedSearchAnalytics applies regexFilter even without the query dimensi
   assert.equal(r.data.metadata.regexFilterApplied, true);
 });
 
-test('permission fallback is skipped when the siteUrl is already sc-domain', async () => {
+test('permission fallback only widens a root URL-prefix property, and keeps the original error', async () => {
   const svc = new SearchConsoleService('/tmp/dummy.json', true);
   const seen = [];
   svc.getClient = async () => ({ searchanalytics: { query: async ({ siteUrl }) => {
-    seen.push(siteUrl); throw Object.assign(new Error('User does not have sufficient permission'), { code: 403 });
+    seen.push(siteUrl);
+    throw Object.assign(new Error(siteUrl.startsWith('sc-domain') ? 'fallback says no permission' : 'User does not have sufficient permission'), { code: 403 });
   } } });
-  await assert.rejects(svc.searchAnalytics('sc-domain:x.com', { startDate: '2026-01-01', endDate: '2026-01-02' }), /Permission denied/);
-  assert.deepEqual(seen, ['sc-domain:x.com']);
-  seen.length = 0;
-  await assert.rejects(svc.searchAnalytics('https://x.com/', { startDate: '2026-01-01', endDate: '2026-01-02' }), /Permission denied/);
-  assert.deepEqual(seen, ['https://x.com/', 'sc-domain:x.com']);
+  const q = (site) => svc.searchAnalytics(site, { startDate: '2026-01-01', endDate: '2026-01-02' });
+  // sc-domain: nothing to fall back to, so no duplicate request.
+  await assert.rejects(q('sc-domain:x.com'), /Permission denied/);
+  assert.deepEqual(seen.splice(0), ['sc-domain:x.com']);
+  // Root prefix: falls back; when that fails too, the error is about the URL the caller named.
+  await assert.rejects(q('https://x.com/'), (e) => /sufficient permission/.test(e.message) && !/fallback says/.test(e.message));
+  assert.deepEqual(seen.splice(0), ['https://x.com/', 'sc-domain:x.com']);
+  // Deeper prefix: a domain fallback would silently widen /blog/ to the whole domain.
+  await assert.rejects(q('https://x.com/blog/'), /Permission denied/);
+  assert.deepEqual(seen.splice(0), ['https://x.com/blog/']);
+});
+
+test('sitemap writes never fall back to another property', async () => {
+  // Regression: a 403 on a URL-prefix property re-sent the DELETE to sc-domain and reported success.
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  const seen = [];
+  const deny = async ({ siteUrl }) => { seen.push(siteUrl); throw Object.assign(new Error('User does not have sufficient permission'), { code: 403 }); };
+  svc.getClient = async () => ({ sitemaps: { submit: deny, delete: deny } });
+  await assert.rejects(svc.deleteSitemap({ siteUrl: 'https://x.com/', feedpath: 'https://x.com/s.xml' }), /Permission denied/);
+  await assert.rejects(svc.submitSitemap({ siteUrl: 'https://x.com/', feedpath: 'https://x.com/s.xml' }), /Permission denied/);
+  assert.deepEqual(seen, ['https://x.com/', 'https://x.com/']);
+});
+
+test('batchInspect stops on a 429 coming through the real client error path', async () => {
+  // Shaped like a gaxios 8 HTTP error: numeric code from the API body, status from the response.
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  svc.quotaTracker.getRecommendedInspectionDelay = () => 0;
+  let calls = 0;
+  svc.getClient = async () => ({ urlInspection: { index: { inspect: async () => {
+    calls++;
+    throw Object.assign(new Error('Quota exceeded for quota metric'), { code: 429, status: 429, response: { status: 429 } });
+  } } } });
+  const r = await svc.batchInspect('sc-domain:ex.com', ['https://ex.com/1', 'https://ex.com/2', 'https://ex.com/3'], 50, 'en-US');
+  assert.equal(calls, 1);
+  assert.equal(r.stoppedEarly.notInspected, 2);
+  assert.match(r.stoppedEarly.reason, /API quota exceeded/);
+});
+
+test('comparePeriods warns when a period starts before its data does', async () => {
+  // A period reaching past the 16-month retention returns rows from partway in.
+  const { svc } = comparator(b => (b.startDate === '2025-06-01' ? dailyRows('2025-06-10', 21) : dailyRows(b.startDate, 30)));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-06-01', '2026-06-30'), week('2025-06-01', '2025-06-30'), 25);
+  assert.equal(c.warnings.length, 1);
+  assert.match(c.warnings[0], /^periodB has data only from 2025-06-10, not 2025-06-01/);
+});
+
+test('quick wins reject an inverted position range', async () => {
+  const { QuickWinsDetectionSchema, EnhancedSearchAnalyticsSchema } = await import('../dist/schemas.js');
+  const base = { siteUrl: 'sc-domain:x', startDate: '2026-01-01', endDate: '2026-01-31' };
+  assert.equal(QuickWinsDetectionSchema.safeParse({ ...base, positionRangeMin: 20, positionRangeMax: 5 }).success, false);
+  assert.equal(QuickWinsDetectionSchema.safeParse({ ...base, positionRangeMin: 5, positionRangeMax: 5 }).success, true);
+  assert.equal(EnhancedSearchAnalyticsSchema.safeParse({ ...base, quickWinsThresholds: { positionRangeMin: 20, positionRangeMax: 5 } }).success, false);
 });

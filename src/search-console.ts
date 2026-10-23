@@ -107,8 +107,8 @@ type DeleteSitemapRequest = searchconsole_v1.Params$Resource$Sitemaps$Delete;
 type IndexInspectRequest = searchconsole_v1.Params$Resource$Urlinspection$Index$Inspect['requestBody'];
 
 /**
- * Retry settings for the API client. The library already retries 408/429/5xx and
- * network failures with exponential backoff (3 tries), but only for GET/HEAD/PUT/
+ * Retry settings for the API client. The library already retries 408/429/5xx (3 tries)
+ * and network failures (2 tries) with exponential backoff, but only for GET/HEAD/PUT/
  * OPTIONS/DELETE. searchanalytics.query and urlInspection.index.inspect are POSTs
  * that only read, so they are safe to retry too.
  */
@@ -206,12 +206,27 @@ export class SearchConsoleService {
     }
   }
 
+  /** True for a URL-prefix property at the root of its host, e.g. https://example.com/ */
+  private isRootUrlPrefix(siteUrl: string): boolean {
+    try {
+      const url = new URL(siteUrl);
+      return (url.protocol === 'https:' || url.protocol === 'http:') && url.pathname === '/' && !url.search;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Wraps an operation with an automatic retry against the normalized sc-domain
    * URL on permission errors, and converts any failure into an actionable error
    * via parseGoogleApiError. This is the single error-handling path for every
-   * API call in this service, so callers do not need their own try/catch.
-   * Skips the retry when the siteUrl is already in normalized form.
+   * read in this service, so callers do not need their own try/catch.
+   *
+   * Only a root URL-prefix property (`https://host/`) falls back: its domain
+   * property covers the same pages. A deeper prefix (`https://host/blog/`) would
+   * silently widen the data to the whole domain, and an sc-domain URL has nothing
+   * to fall back to. If the fallback fails too, the error for the URL the caller
+   * named is reported. Writes never use this (see submitSitemap).
    */
   private async withPermissionFallback<T>(
     siteUrl: string,
@@ -225,12 +240,12 @@ export class SearchConsoleService {
       const errorMessage = err instanceof Error ? err.message.toLowerCase() : '';
 
       const permissionError = errorMessage.includes('permission') || errorMessage.includes('403');
-      if (permissionError && this.normalizeUrl(siteUrl) !== siteUrl) {
-        console.error(`[GSC] Permission error in ${context}, trying normalized URL...`);
+      if (permissionError && this.isRootUrlPrefix(siteUrl)) {
+        console.error(`[GSC] Permission error in ${context}, trying ${this.normalizeUrl(siteUrl)}...`);
         try {
           return await fallbackOperation();
-        } catch (fallbackErr) {
-          throw parseGoogleApiError(fallbackErr);
+        } catch {
+          throw parseGoogleApiError(err);
         }
       }
 
@@ -263,7 +278,7 @@ export class SearchConsoleService {
       }
     }
 
-    const quotaWarning = this.quotaTracker.recordSearchAnalytics();
+    const quotaWarning = this.quotaTracker.recordSearchAnalytics(siteUrl);
     if (quotaWarning) {
       console.error(quotaWarning);
     }
@@ -282,7 +297,7 @@ export class SearchConsoleService {
   }
 
   /**
-   * Returns current API quota usage (per-minute / per-day, per site).
+   * Returns current API quota usage per site (per-minute / per-day).
    */
   getQuotaStatus() {
     return this.quotaTracker.getStatus();
@@ -431,6 +446,13 @@ export class SearchConsoleService {
         : `The dates are in the future or older than the 16-month retention.`;
       return `${name} returned no data for ${start}..${end}. ${why} Its totals are 0 and deltas against it are meaningless: `
         + `end both periods earlier.`;
+    }
+    // Data that starts late: the period reaches past the 16-month retention or before the property had data.
+    const firstDate = rows.reduce<string | null>((min, r) => { const d = r.keys?.[0]?.slice(0, 10) ?? null; return d && (!min || d < min) ? d : min; }, null);
+    if (firstDate && firstDate > start) {
+      return `${name} has data only from ${firstDate}, not ${start}: earlier days are past Search Console's 16-month `
+        + `retention or before the property had data, so its totals cover fewer days than requested. `
+        + `Start both periods on or after ${firstDate} (moving both by the same number of days keeps weekdays aligned).`;
     }
     if (state === 'all' || state === 'hourly_all') {
       const incomplete = metadata?.firstIncompleteDate ?? metadata?.firstIncompleteHour?.slice(0, 10) ?? null;
@@ -761,15 +783,12 @@ export class SearchConsoleService {
 
     const webmasters = await this.getClient();
 
-    return this.withPermissionFallback(
-      request.siteUrl!,
-      () => webmasters.sitemaps.submit(request),
-      () => webmasters.sitemaps.submit({
-        ...request,
-        siteUrl: this.normalizeUrl(request.siteUrl!),
-      }),
-      'submitSitemap',
-    );
+    // A write goes only to the property the caller named: no sc-domain fallback.
+    try {
+      return await webmasters.sitemaps.submit(request);
+    } catch (err) {
+      throw parseGoogleApiError(err);
+    }
   }
 
   /**
@@ -784,15 +803,12 @@ export class SearchConsoleService {
 
     const webmasters = await this.getClient();
 
-    return this.withPermissionFallback(
-      request.siteUrl!,
-      () => webmasters.sitemaps.delete(request),
-      () => webmasters.sitemaps.delete({
-        ...request,
-        siteUrl: this.normalizeUrl(request.siteUrl!),
-      }),
-      'deleteSitemap',
-    );
+    // A write goes only to the property the caller named: no sc-domain fallback.
+    try {
+      return await webmasters.sitemaps.delete(request);
+    } catch (err) {
+      throw parseGoogleApiError(err);
+    }
   }
 
   // ==========================================================================
@@ -809,7 +825,7 @@ export class SearchConsoleService {
       validateSiteUrl(requestBody.siteUrl);
     }
     
-    const quotaWarning = this.quotaTracker.recordUrlInspection();
+    const quotaWarning = this.quotaTracker.recordUrlInspection(requestBody?.siteUrl ?? '');
     if (quotaWarning) {
       console.error(quotaWarning);
     }
@@ -1000,7 +1016,7 @@ export class SearchConsoleService {
       }
       // Use adaptive delay based on quota tracker
       if (i < urls.length - 1) {
-        await new Promise(r => setTimeout(r, this.quotaTracker.getRecommendedInspectionDelay()));
+        await new Promise(r => setTimeout(r, this.quotaTracker.getRecommendedInspectionDelay(siteUrl)));
       }
     }
     return { attempted: urls.length, errors };

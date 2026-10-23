@@ -44,7 +44,7 @@ end to end with both a v1 and a v2 client:
 - Schemas are `z.strictObject`, so the server rejects unknown arguments itself.
   Before, `z.object` silently stripped them: a misspelled `pageFiltr` ran the
   query unfiltered. Only clients that validated against the advertised schema
-  caught it. `tools/list` output is byte-identical to v0.7.0.
+  caught it. The migration itself left the `tools/list` output byte-identical to v0.7.0 (checked before the later additions).
 - Errors are logged to stderr. MCP logging notifications (`sendLoggingMessage`
   and the `logging` capability) are deprecated by the 2026-07-28 spec (SEP-2577),
   which prescribes stderr for stdio servers.
@@ -193,8 +193,8 @@ out on purpose (sites add/delete, the retired mobile-friendly test).
 
 **Fixes**
 
-- Retries. The client library retries 408/429/5xx and network failures (3 tries,
-  exponential backoff), but only for GET/HEAD/PUT/OPTIONS/DELETE, so the two
+- Retries. The client library retries 408/429/5xx (3 tries) and network failures
+  (2 tries) with exponential backoff, but only for GET/HEAD/PUT/OPTIONS/DELETE, so the two
   workhorse calls (`searchanalytics.query`, `urlInspection.index.inspect`, both
   POST) were never retried. `RETRY_CONFIG` adds POST; both calls only read.
   The test proves it against a local HTTP server returning one 503.
@@ -240,6 +240,32 @@ out on purpose (sites add/delete, the retired mobile-friendly test).
   and that `byNewsShowcasePanel` needs type `discover` or `googleNews` with a
   `NEWS_SHOWCASE` search-appearance filter (both verified live).
 
+**PR review (same day).** An independent review of the release PR found these, all fixed with tests:
+
+- The sc-domain fallback also ran for sitemap submit and delete. A 403 on
+  `https://www.example.com/` re-sent the DELETE to `sc-domain:www.example.com`
+  and reported success, so a write could change a property the caller never
+  named. Writes no longer fall back. Reads fall back only from a root URL-prefix
+  property, because `https://x.com/blog/` falling back to `sc-domain:x.com`
+  silently widened the data to the whole domain. When the fallback fails too,
+  the error for the URL the caller named is reported, not the fallback's.
+- `QuotaTracker` was one process-wide counter labelled "per site". It is now keyed
+  by siteUrl, so batches on different properties no longer share a budget or slow
+  each other down. `get_quota_status` now returns `{ sites: { <siteUrl>: … } }`.
+- `compare_periods` didn't flag a period whose data starts after its `startDate`
+  (past the 16-month retention, or before the property had data). It now warns.
+- An inverted quick-wins position range (min > max) passed validation and returned
+  an empty "complete" result. It is now rejected.
+- The quota-stop test now drives a gaxios-shaped 429 through the real client path.
+
+Observed during that re-test: near the 16-month retention edge the API isn't
+deterministic. The same date-grouped query for June 2025 returned 21 days
+(from 2025-06-10) on every call in one server process, and 0 days on every call
+in another, minutes apart. It looks like it depends on which backend the
+connection lands on. Both outcomes are flagged by `compare_periods` (late-start
+or no-data warning), so no code change; just don't treat retention-edge numbers
+as stable.
+
 **Considered and skipped**: `outputSchema`/`structuredContent` (LLM clients read
 the text block anyway) and MCP prompts or resources (no workflow needs them yet).
 
@@ -249,4 +275,5 @@ the text block anyway) and MCP prompts or resources (no workflow needs them yet)
 - [ ] `CHANGELOG.md` and semver discipline.
 - [ ] CI (GitHub Actions: build, test, `osv-scanner`).
 - [ ] Dependabot or renovate for ongoing vulnerability monitoring.
+- [ ] Sitemap fetching follows whatever URLs a site's `robots.txt` and sitemap index list, including private or internal hosts. That's low risk for a local tool pointed at your own properties, but if this server ever runs shared or remotely, restrict fetches to the property's host.
 - [ ] Sitemap fetching (`fetchText`) sends a spoofed Googlebot `User-Agent`. Sites that verify Googlebot by reverse DNS may block it, and it misrepresents the client. Consider an honest UA such as `mcp-server-gsc/<version>`. Left as is because it changes which sitemaps some sites serve.

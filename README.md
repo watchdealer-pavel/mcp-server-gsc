@@ -33,7 +33,7 @@ Gives your AI agent direct access to Google Search Console through 16 tools:
 | `get_sitemap` | Get details for a specific sitemap |
 | `submit_sitemap` | Submit a new sitemap |
 | `delete_sitemap` | Remove a sitemap |
-| `get_quota_status` | Report the API quota usage the server is tracking |
+| `get_quota_status` | Report the API quota usage the server is tracking, per site |
 
 **Hourly data.** `search_analytics` supports Google's hourly export. Pass `dimensions: "hour"` with `dataState: "hourly_all"` and a range of 10 days or less to get hour-by-hour clicks and impressions.
 
@@ -258,7 +258,7 @@ URLs that fail to inspect are listed under `errors`, so a failure never reads as
 
 ## Good to know
 
-**siteUrl format.** Use `sc-domain:example.com` for domain properties or `https://www.example.com/` for URL-prefix properties. Run `list_sites` to see the exact string.
+**siteUrl format.** Use `sc-domain:example.com` for domain properties or `https://www.example.com/` for URL-prefix properties. Run `list_sites` to see the exact string. If a read is denied for a root URL such as `https://example.com/`, the server retries it once against `sc-domain:example.com`, since that domain property covers the same pages. It never does this for a deeper prefix such as `https://example.com/blog/`, which would widen the data to the whole domain, or for sitemap submit and delete, which only change the property you named.
 
 **Data freshness.** GSC data lags two to three days. Use `dataState: "all"` to include recent unfinalized data, or `dataState: "hourly_all"` with the `hour` dimension for hourly data over the last 10 days.
 
@@ -266,9 +266,9 @@ URLs that fail to inspect are listed under `errors`, so a failure never reads as
 
 **Date ranges.** Up to 16 months, formatted `YYYY-MM-DD`.
 
-**Quota.** Google's per-site limits are 1,200 queries per minute for Search Analytics, and 600 per minute plus 2,000 per day for URL Inspection. The server tracks usage, warns at 80%, throttles batch inspections automatically, and reports what it sees through `get_quota_status`. If `batch_inspect` or `rich_results_check` still hits a quota error, it stops, returns what it has done, and reports how many URLs it skipped under `stoppedEarly`.
+**Quota.** Google's per-site limits are 1,200 queries per minute for Search Analytics, and 600 per minute plus 2,000 per day for URL Inspection. The server tracks usage per site, warns at 80%, throttles batch inspections automatically, and reports what it sees through `get_quota_status`. If `batch_inspect` or `rich_results_check` still hits a quota error, it stops, returns what it has done, and reports how many URLs it skipped under `stoppedEarly`.
 
-**Retries.** Transient failures (rate limits, Google 5xx errors, network drops) are retried up to three times with exponential backoff before a tool reports an error.
+**Retries.** Rate limits and Google 5xx errors are retried up to three times, and network drops up to twice, with exponential backoff before a tool reports an error.
 
 ---
 

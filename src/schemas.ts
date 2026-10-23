@@ -229,6 +229,10 @@ export const QuickWinsThresholdsSchema = z.strictObject({
     .describe('Estimated conversion rate (0-1)'),
 });
 
+// Without this, an inverted range matches nothing and reads as "no quick wins".
+const positionRangeOrdered = (t: { positionRangeMin: number; positionRangeMax: number }) => t.positionRangeMin <= t.positionRangeMax;
+const positionRangeError = { message: 'positionRangeMin must be less than or equal to positionRangeMax', path: ['positionRangeMin'] };
+
 export const QuickWinsDetectionSchema = GSCBaseSchema.extend({
   startDate: z
     .string()
@@ -238,7 +242,7 @@ export const QuickWinsDetectionSchema = GSCBaseSchema.extend({
     .string()
     .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
     .describe('End date in YYYY-MM-DD format'),
-}).extend(QuickWinsThresholdsSchema.shape);
+}).extend(QuickWinsThresholdsSchema.shape).refine(positionRangeOrdered, positionRangeError);
 
 // ============================================================================
 // Pagination Schema (fetch beyond the 25k-per-request cap)
@@ -290,7 +294,7 @@ export const EnhancedSearchAnalyticsSchema = SearchAnalyticsSchema.extend({
     .boolean()
     .default(false)
     .describe('Enable automatic quick wins detection'),
-  quickWinsThresholds: QuickWinsThresholdsSchema.optional()
+  quickWinsThresholds: QuickWinsThresholdsSchema.refine(positionRangeOrdered, positionRangeError).optional()
     .describe('Custom thresholds for quick wins detection'),
 });
 
@@ -303,7 +307,6 @@ export const CannibalizationSchema = SearchAnalyticsSchema.pick({
   startDate: true,
   endDate: true,
   type: true,
-  dataState: true,
   pageFilter: true,
   queryFilter: true,
   countryFilter: true,
@@ -312,6 +315,11 @@ export const CannibalizationSchema = SearchAnalyticsSchema.pick({
   filterOperator: true,
   filters: true,
 }).extend({
+  // hourly_all only allows grouping by hour, so it can't serve a query+page request.
+  dataState: z
+    .enum(['final', 'all'])
+    .default('final')
+    .describe('Data freshness: "final" = finalized only; "all" = includes fresh unfinalized data'),
   minImpressions: z
     .coerce.number()
     .int()
