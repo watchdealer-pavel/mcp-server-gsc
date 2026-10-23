@@ -3,9 +3,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { gzipSync } from 'node:zlib';
-import { SearchConsoleService } from '../dist/search-console.js';
+import { SearchConsoleService, RETRY_CONFIG } from '../dist/search-console.js';
 import {
-  validateDateRange, validateHourlyRange, validateSiteUrl,
+  validateDateRange, validateHourlyRange, validateSiteUrl, validateRegex,
   sanitizeForLogging, parseGoogleApiError,
 } from '../dist/validators.js';
 
@@ -231,4 +231,179 @@ test('searchAnalyticsPaginated pages through and respects maxRows', async () => 
   const capped = await svc.searchAnalyticsPaginated('sc-domain:x', { dimensions: ['query'] }, 10000);
   assert.equal(capped.data.rows.length, 10000);
   assert.equal(capped.data.pagesFetched, 1);
+});
+
+test('detectCannibalization groups by query and keeps pages above minShare', async () => {
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  svc.searchAnalytics = async () => ({ data: { rows: [
+    { keys: ['shoes', '/a'], clicks: 10, impressions: 600, position: 4 },
+    { keys: ['shoes', '/b'], clicks: 5, impressions: 350, position: 7 },
+    { keys: ['shoes', '/c'], clicks: 0, impressions: 50, position: 30 },  // 5% share: below 10%
+    { keys: ['boots', '/a'], clicks: 3, impressions: 900, position: 2 },
+    { keys: ['boots', '/d'], clicks: 0, impressions: 40, position: 40 },  // ~4%: only one page left
+    { keys: ['rare', '/a'], clicks: 0, impressions: 20, position: 9 },
+    { keys: ['rare', '/b'], clicks: 0, impressions: 20, position: 9 },    // total 40 < minImpressions
+  ] } });
+  const r = await svc.detectCannibalization('sc-domain:x', { rowLimit: 25000 }, { minImpressions: 50, minShare: 0.1, topN: 50 });
+  assert.equal(r.totalCandidates, 1);
+  assert.equal(r.queriesAnalyzed, 3);
+  assert.equal(r.candidates[0].query, 'shoes');
+  assert.equal(r.candidates[0].impressions, 1000);
+  assert.deepEqual(r.candidates[0].pages.map(p => [p.page, p.share]), [['/a', 0.6], ['/b', 0.35]]);
+  assert.equal(r.warning, undefined);
+  const capped = await svc.detectCannibalization('sc-domain:x', { rowLimit: 7 }, { minImpressions: 50, minShare: 0.1, topN: 50 });
+  assert.match(capped.warning, /7-row cap/);
+});
+
+test('richResultsCheck reports failed URLs instead of silently dropping them', async () => {
+  // Regression: errors were swallowed, so a quota or permission failure read as "no rich results".
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  svc.quotaTracker.getRecommendedInspectionDelay = () => 0;
+  svc.indexInspect = async ({ inspectionUrl }) => {
+    if (inspectionUrl.endsWith('/bad')) throw Object.assign(new Error('Permission denied'), { code: 403 });
+    return { data: { inspectionResult: { inspectionResultLink: 'https://search.google.com/x', richResultsResult: {
+      verdict: 'PASS', detectedItems: [{ richResultType: 'FAQ', items: [{ name: 'q' }] }] } } } };
+  };
+  const r = await svc.richResultsCheck('sc-domain:ex.com', ['https://ex.com/ok', 'https://ex.com/bad'], 20, 'en-US');
+  assert.equal(r.totalChecked, 2);
+  assert.equal(r.urlsWithRichResults, 1);
+  assert.equal(r.results[0].inspectionResultLink, 'https://search.google.com/x');
+  assert.deepEqual(r.errors.map(e => e.url), ['https://ex.com/bad']);
+});
+
+test('batchInspect stops on a quota error and reports what it skipped', async () => {
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  svc.quotaTracker.getRecommendedInspectionDelay = () => 0;
+  let calls = 0;
+  svc.indexInspect = async () => {
+    if (++calls === 2) throw parseGoogleApiError({ code: 429, message: 'Quota exceeded' });
+    return { data: { inspectionResult: { inspectionResultLink: 'L', indexStatusResult: { verdict: 'FAIL', crawledAs: 'MOBILE', referringUrls: ['https://ex.com/r'] } } } };
+  };
+  const urls = ['https://ex.com/1', 'https://ex.com/2', 'https://ex.com/3', 'https://ex.com/4'];
+  const r = await svc.batchInspect('sc-domain:ex.com', urls, 50, 'en-US');
+  assert.equal(calls, 2);
+  assert.equal(r.totalInspected, 2);
+  assert.equal(r.stoppedEarly.notInspected, 2);
+  assert.match(r.stoppedEarly.reason, /quota exceeded/i);
+  assert.equal(r.results.fail[0].crawledAs, 'MOBILE');
+  assert.equal(r.results.fail[0].inspectionResultLink, 'L');
+  assert.deepEqual(r.results.fail[0].referringUrls, ['https://ex.com/r']);
+});
+
+test('RETRY_CONFIG makes the read-only POST calls retry a transient 503', async () => {
+  // Real client against a local server: the library alone does not retry POSTs.
+  const { createServer } = await import('node:http');
+  const { searchconsole } = await import('@googleapis/searchconsole');
+  let hits = 0;
+  const server = createServer((req, res) => {
+    hits++;
+    if (hits === 1) { res.writeHead(503).end('{}'); return; }
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"rows":[]}');
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const rootUrl = `http://127.0.0.1:${server.address().port}/`;
+  const query = (opts) => searchconsole({ version: 'v1', auth: 'test-api-key', rootUrl, ...opts })
+    .searchanalytics.query({ siteUrl: 'sc-domain:x', requestBody: { startDate: '2026-01-01', endDate: '2026-01-02' } });
+  try {
+    await assert.rejects(query({}));   // library default: POST is not retried
+    assert.equal(hits, 1);
+    hits = 0;
+    const resp = await query({ retryConfig: RETRY_CONFIG });
+    assert.equal(hits, 2);
+    assert.deepEqual(resp.data, { rows: [] });
+  } finally {
+    server.close();
+  }
+});
+
+test('validateRegex follows RE2, the dialect Search Console uses', () => {
+  // Valid RE2 that JS RegExp rejects: the old JS-based check refused these.
+  for (const p of ['(?i)rolex|omega', '(?P<brand>acme)', '\\pL+', '[[:alpha:]]+']) validateRegex(p);
+  // Invalid RE2 that Google silently treats as "match nothing" (verified live).
+  for (const p of ['(?=a)', '(?!a)', '(?<=a)b', '(a)\\1', '([', 'a++']) {
+    assert.throws(() => validateRegex(p), /RE2 syntax/, p);
+  }
+});
+
+test('searchAnalytics rejects an invalid RE2 filter before calling the API', async () => {
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  let called = false;
+  svc.getClient = async () => ({ searchanalytics: { query: async () => { called = true; return { data: {} }; } } });
+  const body = (expression) => ({ startDate: '2026-01-01', endDate: '2026-01-10',
+    dimensionFilterGroups: [{ groupType: 'and', filters: [{ dimension: 'query', operator: 'includingRegex', expression }] }] });
+  await assert.rejects(svc.searchAnalytics('sc-domain:x.com', body('(?=brand)')), /RE2 syntax/);
+  assert.equal(called, false);
+  await svc.searchAnalytics('sc-domain:x.com', body('(?i)brand'));
+  assert.equal(called, true);
+});
+
+test('enhancedSearchAnalytics applies regexFilter even without the query dimension', async () => {
+  // Regression: it reported regexFilterApplied: true but skipped the filter unless grouping by query.
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  let sent;
+  svc.searchAnalytics = async (_s, body) => { sent = body; return { data: { rows: [] } }; };
+  const r = await svc.enhancedSearchAnalytics('sc-domain:x', { dimensions: ['page'] }, { regexFilter: '(?i)watch' });
+  assert.deepEqual(sent.dimensionFilterGroups.at(-1).filters, [{ dimension: 'query', operator: 'includingRegex', expression: '(?i)watch' }]);
+  assert.equal(r.data.metadata.regexFilterApplied, true);
+});
+
+test('permission fallback only widens a root URL-prefix property, and keeps the original error', async () => {
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  const seen = [];
+  svc.getClient = async () => ({ searchanalytics: { query: async ({ siteUrl }) => {
+    seen.push(siteUrl);
+    throw Object.assign(new Error(siteUrl.startsWith('sc-domain') ? 'fallback says no permission' : 'User does not have sufficient permission'), { code: 403 });
+  } } });
+  const q = (site) => svc.searchAnalytics(site, { startDate: '2026-01-01', endDate: '2026-01-02' });
+  // sc-domain: nothing to fall back to, so no duplicate request.
+  await assert.rejects(q('sc-domain:x.com'), /Permission denied/);
+  assert.deepEqual(seen.splice(0), ['sc-domain:x.com']);
+  // Root prefix: falls back; when that fails too, the error is about the URL the caller named.
+  await assert.rejects(q('https://x.com/'), (e) => /sufficient permission/.test(e.message) && !/fallback says/.test(e.message));
+  assert.deepEqual(seen.splice(0), ['https://x.com/', 'sc-domain:x.com']);
+  // Deeper prefix: a domain fallback would silently widen /blog/ to the whole domain.
+  await assert.rejects(q('https://x.com/blog/'), /Permission denied/);
+  assert.deepEqual(seen.splice(0), ['https://x.com/blog/']);
+});
+
+test('sitemap writes never fall back to another property', async () => {
+  // Regression: a 403 on a URL-prefix property re-sent the DELETE to sc-domain and reported success.
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  const seen = [];
+  const deny = async ({ siteUrl }) => { seen.push(siteUrl); throw Object.assign(new Error('User does not have sufficient permission'), { code: 403 }); };
+  svc.getClient = async () => ({ sitemaps: { submit: deny, delete: deny } });
+  await assert.rejects(svc.deleteSitemap({ siteUrl: 'https://x.com/', feedpath: 'https://x.com/s.xml' }), /Permission denied/);
+  await assert.rejects(svc.submitSitemap({ siteUrl: 'https://x.com/', feedpath: 'https://x.com/s.xml' }), /Permission denied/);
+  assert.deepEqual(seen, ['https://x.com/', 'https://x.com/']);
+});
+
+test('batchInspect stops on a 429 coming through the real client error path', async () => {
+  // Shaped like a gaxios 8 HTTP error: numeric code from the API body, status from the response.
+  const svc = new SearchConsoleService('/tmp/dummy.json', true);
+  svc.quotaTracker.getRecommendedInspectionDelay = () => 0;
+  let calls = 0;
+  svc.getClient = async () => ({ urlInspection: { index: { inspect: async () => {
+    calls++;
+    throw Object.assign(new Error('Quota exceeded for quota metric'), { code: 429, status: 429, response: { status: 429 } });
+  } } } });
+  const r = await svc.batchInspect('sc-domain:ex.com', ['https://ex.com/1', 'https://ex.com/2', 'https://ex.com/3'], 50, 'en-US');
+  assert.equal(calls, 1);
+  assert.equal(r.stoppedEarly.notInspected, 2);
+  assert.match(r.stoppedEarly.reason, /API quota exceeded/);
+});
+
+test('comparePeriods warns when a period starts before its data does', async () => {
+  // A period reaching past the 16-month retention returns rows from partway in.
+  const { svc } = comparator(b => (b.startDate === '2025-06-01' ? dailyRows('2025-06-10', 21) : dailyRows(b.startDate, 30)));
+  const c = await svc.comparePeriods('sc-domain:x', week('2026-06-01', '2026-06-30'), week('2025-06-01', '2025-06-30'), 25);
+  assert.equal(c.warnings.length, 1);
+  assert.match(c.warnings[0], /^periodB has data only from 2025-06-10, not 2025-06-01/);
+});
+
+test('quick wins reject an inverted position range', async () => {
+  const { QuickWinsDetectionSchema, EnhancedSearchAnalyticsSchema } = await import('../dist/schemas.js');
+  const base = { siteUrl: 'sc-domain:x', startDate: '2026-01-01', endDate: '2026-01-31' };
+  assert.equal(QuickWinsDetectionSchema.safeParse({ ...base, positionRangeMin: 20, positionRangeMax: 5 }).success, false);
+  assert.equal(QuickWinsDetectionSchema.safeParse({ ...base, positionRangeMin: 5, positionRangeMax: 5 }).success, true);
+  assert.equal(EnhancedSearchAnalyticsSchema.safeParse({ ...base, quickWinsThresholds: { positionRangeMin: 20, positionRangeMax: 5 } }).success, false);
 });

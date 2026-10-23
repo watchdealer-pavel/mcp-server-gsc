@@ -3,3 +3,10 @@ dist/
 *.log
 .env*
 credentials.json
+# Google service-account keys under any common name
+*credentials*.json
+*service-account*.json
+*sa-key*.json
+*.pem
+*.p12
+*.key

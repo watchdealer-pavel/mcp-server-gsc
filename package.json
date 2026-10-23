@@ -1,8 +1,8 @@
 {
   "name": "mcp-server-gsc",
-  "version": "0.7.0",
-  "description": "Enhanced Model Context Protocol server for Google Search Console with 25K row limit, regex filters, and automatic quick wins detection",
-  "author": "Yuexun Jiang <yuexunjiang@gmail.com>",
+  "version": "0.8.0",
+  "description": "MCP server for Google Search Console: search analytics with multi-condition and regex filters, period comparison, quick-wins and cannibalization detection, URL inspection and sitemap management",
+  "author": "Pavel from ChronoTimepieces (https://github.com/watchdealer-pavel)",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -12,28 +12,33 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && shx chmod +x dist/*.js",
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/index.js', 0o755)\"",
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "test": "node --test"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "google-auth-library": "^10.9.0",
-    "googleapis": "^173.0.0",
-    "zod": "^4.4.3"
+    "@googleapis/searchconsole": "^11.0.1",
+    "@modelcontextprotocol/server": "^2.3.1",
+    "re2js": "^2.8.6",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "shx": "^0.4.0",
-    "tsx": "^4.23.0",
-    "typescript": "^6.0.3"
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2"
   },
   "overrides": {
-    "buffer-equal-constant-time": "file:./patches/buffer-equal-constant-time",
-    "google-auth-library": "$google-auth-library"
+    "buffer-equal-constant-time": "file:./patches/buffer-equal-constant-time"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/watchdealer-pavel/mcp-server-gsc.git"
+  },
+  "homepage": "https://github.com/watchdealer-pavel/mcp-server-gsc#readme",
+  "bugs": {
+    "url": "https://github.com/watchdealer-pavel/mcp-server-gsc/issues"
   }
 }
