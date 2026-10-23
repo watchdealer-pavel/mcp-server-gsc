@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { McpServer } from '@modelcontextprotocol/server';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import { sanitizeForLogging } from './validators.js';
 
 import {
   BatchInspectSchema,
+  CannibalizationSchema,
   ComparePeriodsSchema,
   CoverageReportSchema,
   DeleteSitemapSchema,
@@ -30,7 +30,7 @@ import { SearchConsoleService } from './search-console.js';
 
 const SERVER_NAME = 'gsc-mcp-server';
 // Keep in sync with "version" in package.json
-const SERVER_VERSION = '0.7.0';
+const SERVER_VERSION = '0.8.0';
 
 // ============================================================================
 // Environment & Service Initialization
@@ -68,10 +68,13 @@ function formatResponse(data: unknown): { content: Array<{ type: 'text'; text: s
 type QueryArgs = Omit<SearchAnalytics, 'rowLimit' | 'startRow'> &
   Partial<Pick<SearchAnalytics, 'rowLimit' | 'startRow'>>;
 
+type FilterArgs = Pick<SearchAnalytics,
+  'pageFilter' | 'queryFilter' | 'countryFilter' | 'deviceFilter' | 'searchAppearanceFilter' | 'filterOperator' | 'filters'>;
+
 /**
  * Builds dimension filter groups from search analytics arguments
  */
-function buildFilterGroups(args: QueryArgs): Array<{
+function buildFilterGroups(args: FilterArgs): Array<{
   groupType: 'and';
   filters: Array<{ dimension: string; operator: string; expression: string }>;
 }> | undefined {
@@ -93,7 +96,7 @@ function buildFilterGroups(args: QueryArgs): Array<{
     });
   }
 
-  // Country, device, and searchAppearance only support 'equals' operator
+  // The country/device/searchAppearance shorthands match exactly; `filters` takes any operator.
   if (args.countryFilter) {
     filters.push({
       dimension: 'country',
@@ -117,6 +120,8 @@ function buildFilterGroups(args: QueryArgs): Array<{
       expression: args.searchAppearanceFilter,
     });
   }
+
+  if (args.filters) filters.push(...args.filters);
 
   return filters.length > 0 ? [{ groupType: 'and', filters }] : undefined;
 }
@@ -142,377 +147,242 @@ function buildSearchAnalyticsRequest(args: QueryArgs) {
 // Server Setup
 // ============================================================================
 
-const server = new Server(
-  {
-    name: SERVER_NAME,
-    version: SERVER_VERSION,
-  },
-  {
-    capabilities: {
-      tools: {},
-      logging: {},
-    },
-  },
-);
+const server = new McpServer({
+  name: SERVER_NAME,
+  version: SERVER_VERSION,
+});
 
-// ============================================================================
-// Tool Definitions
-// ============================================================================
-
-// Advertise the input shape, so arguments with defaults stay optional, while still
-// rejecting unknown keys: a misspelled filter should fail, not be silently dropped.
-function toolSchema(schema: z.ZodType) {
-  return z.toJSONSchema(schema, {
-    io: 'input',
-    override: (ctx) => {
-      if (ctx.jsonSchema.type === 'object' && ctx.jsonSchema.additionalProperties === undefined) {
-        ctx.jsonSchema.additionalProperties = false;
-      }
-    },
-  });
+/**
+ * Runs a tool and returns its result as JSON text. McpServer has already validated
+ * the arguments against the tool's schema (unknown keys are rejected: the schemas
+ * are strict objects) and reports a thrown error to the client as an `isError`
+ * result. Errors are logged to stderr, the logging path the 2026-07-28 spec
+ * prescribes for stdio servers, after redacting secrets and credential paths.
+ */
+async function respond(name: string, run: () => unknown) {
+  try {
+    return formatResponse(await run());
+  } catch (error) {
+    const sanitized = sanitizeForLogging(error instanceof Error ? error.message : String(error));
+    console.error(`[${name}] ${sanitized}`);
+    throw new Error(sanitized);
+  }
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: 'list_sites',
-        description: 'List all sites you have access to in Google Search Console',
-        inputSchema: toolSchema(z.object({})),
-      },
-      {
-        name: 'search_analytics',
-        description: 'Query search performance data (clicks, impressions, CTR, position) from Google Search Console',
-        inputSchema: toolSchema(SearchAnalyticsSchema),
-      },
-      {
-        name: 'enhanced_search_analytics',
-        description: 'Advanced search analytics with up to 25,000 rows, regex filters, data freshness control, and optional quick wins detection',
-        inputSchema: toolSchema(EnhancedSearchAnalyticsSchema),
-      },
-      {
-        name: 'search_analytics_all',
-        description: 'Fetch search analytics beyond the 25,000-row-per-request cap by auto-paginating (up to 50,000 rows; the API caps data at ~50k/day per property per search type)',
-        inputSchema: toolSchema(SearchAnalyticsAllSchema),
-      },
-      {
-        name: 'compare_periods',
-        description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth. Each period reports dataThrough (last date with data); if the response has warnings, a period\'s totals are not comparable (missing unfinalized days under dataState "final", partial days under "all", or no data); follow the warning\'s advice and re-run. Do not switch to dataState "all" to avoid the warning: it includes partial recent days and is flagged too.',
-        inputSchema: toolSchema(ComparePeriodsSchema),
-      },
-      {
-        name: 'get_quota_status',
-        description: 'Report current API quota usage this process is tracking (Search Analytics per-minute; URL Inspection per-minute and per-day, per site)',
-        inputSchema: toolSchema(z.object({})),
-      },
-      {
-        name: 'detect_quick_wins',
-        description: 'Analyze search data to find SEO quick wins - keywords with high impressions but low CTR that could benefit from optimization',
-        inputSchema: toolSchema(QuickWinsDetectionSchema),
-      },
-      {
-        name: 'index_inspect',
-        description: 'Inspect a URL to check its indexing status, crawl info, and any issues preventing indexing',
-        inputSchema: toolSchema(IndexInspectSchema),
-      },
-      {
-        name: 'list_sitemaps',
-        description: 'List all sitemaps submitted for a site in Google Search Console',
-        inputSchema: toolSchema(ListSitemapsSchema),
-      },
-      {
-        name: 'get_sitemap',
-        description: 'Get detailed information about a specific sitemap including status and error counts',
-        inputSchema: toolSchema(GetSitemapSchema),
-      },
-      {
-        name: 'submit_sitemap',
-        description: 'Submit a new sitemap to Google Search Console for crawling',
-        inputSchema: toolSchema(SubmitSitemapSchema),
-      },
-      {
-        name: 'delete_sitemap',
-        description: 'Delete a sitemap from Google Search Console',
-        inputSchema: toolSchema(DeleteSitemapSchema),
-      },
-      {
-        name: 'batch_inspect',
-        description: 'Inspect multiple URLs in batch, grouping results by indexing verdict (PASS/FAIL/PARTIAL). Fetches URLs from sitemap if not provided.',
-        inputSchema: toolSchema(BatchInspectSchema),
-      },
-      {
-        name: 'coverage_report',
-        description: 'Cross-reference sitemap URLs with search analytics to find unindexed pages and orphaned URLs not in sitemap',
-        inputSchema: toolSchema(CoverageReportSchema),
-      },
-      {
-        name: 'rich_results_check',
-        description: 'Inspect URLs for rich results (structured data) issues and detected item types',
-        inputSchema: toolSchema(RichResultsCheckSchema),
-      },
-    ],
+const NoArgsSchema = z.strictObject({});
+
+// MCP tool annotations: clients use them to auto-approve safe calls and to confirm risky ones.
+const READ_ONLY = { readOnlyHint: true } as const;
+
+// ============================================================================
+// Tools
+// ============================================================================
+
+// --------------------------------------------------------------------
+// Sites
+// --------------------------------------------------------------------
+server.registerTool('list_sites', {
+  description: 'List all sites you have access to in Google Search Console',
+  inputSchema: NoArgsSchema,
+  annotations: READ_ONLY,
+}, () => respond('list_sites', async () => (await searchConsoleService.listSites()).data));
+
+// --------------------------------------------------------------------
+// Search Analytics
+// --------------------------------------------------------------------
+server.registerTool('search_analytics', {
+  description: 'Query search performance data (clicks, impressions, CTR, position) from Google Search Console',
+  inputSchema: SearchAnalyticsSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('search_analytics', async () =>
+  (await searchConsoleService.searchAnalytics(args.siteUrl, buildSearchAnalyticsRequest(args))).data));
+
+server.registerTool('enhanced_search_analytics', {
+  description: 'Advanced search analytics with up to 25,000 rows, regex filters, data freshness control, and optional quick wins detection',
+  inputSchema: EnhancedSearchAnalyticsSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('enhanced_search_analytics', async () =>
+  (await searchConsoleService.enhancedSearchAnalytics(
+    args.siteUrl,
+    buildSearchAnalyticsRequest(args),
+    {
+      regexFilter: args.regexFilter,
+      enableQuickWins: args.enableQuickWins,
+      quickWinsThresholds: args.quickWinsThresholds,
+    },
+  )).data));
+
+server.registerTool('search_analytics_all', {
+  description: 'Fetch search analytics beyond the 25,000-row-per-request cap by auto-paginating (up to 50,000 rows; the API caps data at ~50k/day per property per search type)',
+  inputSchema: SearchAnalyticsAllSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('search_analytics_all', async () =>
+  (await searchConsoleService.searchAnalyticsPaginated(
+    args.siteUrl,
+    buildSearchAnalyticsRequest(args),
+    args.maxRows,
+  )).data));
+
+server.registerTool('compare_periods', {
+  description: 'Compare two date ranges: per-period totals (clicks, impressions, CTR, position) with deltas and % change, plus top movers per key when grouped by dimensions. Deltas are the primary period (startDate/endDate) minus the comparison period, so positive click deltas mean growth. Each period reports dataThrough (last date with data); if the response has warnings, a period\'s totals are not comparable (missing unfinalized days under dataState "final", partial days under "all", or no data); follow the warning\'s advice and re-run. Do not switch to dataState "all" to avoid the warning: it includes partial recent days and is flagged too.',
+  inputSchema: ComparePeriodsSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('compare_periods', () =>
+  searchConsoleService.comparePeriods(
+    args.siteUrl,
+    buildSearchAnalyticsRequest(args),
+    buildSearchAnalyticsRequest({ ...args, startDate: args.compareStartDate, endDate: args.compareEndDate }),
+    args.topN,
+  )));
+
+server.registerTool('get_quota_status', {
+  description: 'Report current API quota usage this process is tracking (Search Analytics per-minute; URL Inspection per-minute and per-day, per site)',
+  inputSchema: NoArgsSchema,
+  annotations: READ_ONLY,
+}, () => respond('get_quota_status', () => searchConsoleService.getQuotaStatus()));
+
+server.registerTool('detect_quick_wins', {
+  description: 'Analyze search data to find SEO quick wins - keywords with high impressions but low CTR that could benefit from optimization',
+  inputSchema: QuickWinsDetectionSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('detect_quick_wins', async () => {
+  // Fetch comprehensive data for analysis (25K rows with query+page dimensions)
+  const requestBody = {
+    startDate: args.startDate,
+    endDate: args.endDate,
+    dimensions: ['query', 'page'],
+    rowLimit: 25000,
+    dataState: 'final' as const,
   };
-});
 
-// ============================================================================
-// Tool Handlers
-// ============================================================================
+  // Single API call with quick wins detection enabled
+  const response = await searchConsoleService.enhancedSearchAnalytics(
+    args.siteUrl,
+    requestBody,
+    {
+      enableQuickWins: true,
+      quickWinsThresholds: {
+        minImpressions: args.minImpressions,
+        maxCtr: args.maxCtr,
+        positionRangeMin: args.positionRangeMin,
+        positionRangeMax: args.positionRangeMax,
+        targetCtr: args.targetCtr,
+        estimatedClickValue: args.estimatedClickValue,
+        conversionRate: args.conversionRate,
+      },
+    },
+  );
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const toolName = request.params.name;
-  const args = request.params.arguments ?? {};
+  // Return focused quick wins report
+  return {
+    quickWins: response.data.quickWins ?? [],
+    summary: {
+      totalOpportunities: response.data.quickWins?.length ?? 0,
+      totalAdditionalClicks: response.data.quickWins?.reduce((sum, qw) => sum + qw.additionalClicks, 0) ?? 0,
+      totalEstimatedValue: response.data.quickWins?.reduce((sum, qw) => sum + qw.estimatedValue, 0) ?? 0,
+      thresholds: {
+        minImpressions: args.minImpressions,
+        maxCtr: args.maxCtr,
+        positionRange: `${args.positionRangeMin}-${args.positionRangeMax}`,
+        targetCtr: args.targetCtr,
+      },
+    },
+    analysisComplete: true,
+  };
+}));
 
-  try {
-    switch (toolName) {
-      // --------------------------------------------------------------------
-      // Sites
-      // --------------------------------------------------------------------
-      case 'list_sites': {
-        const response = await searchConsoleService.listSites();
-        return formatResponse(response.data);
-      }
+server.registerTool('detect_cannibalization', {
+  description: 'Find keyword cannibalization: queries where two or more of your pages each get a meaningful share of the impressions, so they compete for the same searches. Returns each such query with its competing pages (impressions, clicks, position, share). Accepts the same filters as search_analytics, e.g. to limit it to one site section or to non-branded queries.',
+  inputSchema: CannibalizationSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('detect_cannibalization', () =>
+  searchConsoleService.detectCannibalization(
+    args.siteUrl,
+    {
+      startDate: args.startDate,
+      endDate: args.endDate,
+      dimensions: ['query', 'page'],
+      searchType: args.type,
+      dataState: args.dataState,
+      rowLimit: 25000,
+      dimensionFilterGroups: buildFilterGroups(args),
+    },
+    { minImpressions: args.minImpressions, minShare: args.minShare, topN: args.topN },
+  )));
 
-      // --------------------------------------------------------------------
-      // Search Analytics
-      // --------------------------------------------------------------------
-      case 'search_analytics': {
-        const parsed = SearchAnalyticsSchema.parse(args);
-        const requestBody = buildSearchAnalyticsRequest(parsed);
-        const response = await searchConsoleService.searchAnalytics(parsed.siteUrl, requestBody);
-        return formatResponse(response.data);
-      }
+// --------------------------------------------------------------------
+// URL Inspection
+// --------------------------------------------------------------------
+server.registerTool('index_inspect', {
+  description: 'Inspect a URL to check its indexing status, crawl info, and any issues preventing indexing',
+  inputSchema: IndexInspectSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('index_inspect', async () =>
+  (await searchConsoleService.indexInspect({
+    siteUrl: args.siteUrl,
+    inspectionUrl: args.inspectionUrl,
+    languageCode: args.languageCode,
+  })).data));
 
-      case 'enhanced_search_analytics': {
-        const parsed = EnhancedSearchAnalyticsSchema.parse(args);
-        const requestBody = buildSearchAnalyticsRequest(parsed);
+// --------------------------------------------------------------------
+// Sitemaps
+// --------------------------------------------------------------------
+server.registerTool('list_sitemaps', {
+  description: 'List all sitemaps submitted for a site in Google Search Console',
+  inputSchema: ListSitemapsSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('list_sitemaps', async () =>
+  (await searchConsoleService.listSitemaps({ siteUrl: args.siteUrl, sitemapIndex: args.sitemapIndex })).data));
 
-        const response = await searchConsoleService.enhancedSearchAnalytics(
-          parsed.siteUrl,
-          requestBody,
-          {
-            regexFilter: parsed.regexFilter,
-            enableQuickWins: parsed.enableQuickWins,
-            quickWinsThresholds: parsed.quickWinsThresholds,
-          },
-        );
+server.registerTool('get_sitemap', {
+  description: 'Get detailed information about a specific sitemap including status and error counts',
+  inputSchema: GetSitemapSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('get_sitemap', async () =>
+  (await searchConsoleService.getSitemap({ siteUrl: args.siteUrl, feedpath: args.feedpath })).data));
 
-        return formatResponse(response.data);
-      }
+server.registerTool('submit_sitemap', {
+  description: 'Submit a new sitemap to Google Search Console for crawling',
+  inputSchema: SubmitSitemapSchema,
+  // Resubmitting the same sitemap is harmless.
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+}, (args) => respond('submit_sitemap', async () => {
+  const response = await searchConsoleService.submitSitemap({ siteUrl: args.siteUrl, feedpath: args.feedpath });
+  return { success: true, message: `Sitemap ${args.feedpath} submitted successfully`, data: response.data };
+}));
 
-      case 'search_analytics_all': {
-        const parsed = SearchAnalyticsAllSchema.parse(args);
-        const requestBody = buildSearchAnalyticsRequest(parsed);
-        const response = await searchConsoleService.searchAnalyticsPaginated(
-          parsed.siteUrl,
-          requestBody,
-          parsed.maxRows,
-        );
-        return formatResponse(response.data);
-      }
+server.registerTool('delete_sitemap', {
+  description: 'Delete a sitemap from Google Search Console',
+  inputSchema: DeleteSitemapSchema,
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+}, (args) => respond('delete_sitemap', async () => {
+  const response = await searchConsoleService.deleteSitemap({ siteUrl: args.siteUrl, feedpath: args.feedpath });
+  return { success: true, message: `Sitemap ${args.feedpath} deleted successfully`, data: response.data };
+}));
 
-      case 'compare_periods': {
-        const parsed = ComparePeriodsSchema.parse(args);
-        const requestBodyA = buildSearchAnalyticsRequest(parsed);
-        const requestBodyB = buildSearchAnalyticsRequest({
-          ...parsed,
-          startDate: parsed.compareStartDate,
-          endDate: parsed.compareEndDate,
-        });
-        const response = await searchConsoleService.comparePeriods(
-          parsed.siteUrl,
-          requestBodyA,
-          requestBodyB,
-          parsed.topN,
-        );
-        return formatResponse(response);
-      }
+// --------------------------------------------------------------------
+// Batch Inspect, Coverage Report, Rich Results Check
+// --------------------------------------------------------------------
+server.registerTool('batch_inspect', {
+  description: 'Inspect multiple URLs in batch, grouping results by indexing verdict (PASS/FAIL/PARTIAL). Fetches URLs from sitemap if not provided.',
+  inputSchema: BatchInspectSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('batch_inspect', () =>
+  searchConsoleService.batchInspect(args.siteUrl, args.urls, args.maxUrls, args.languageCode)));
 
-      case 'get_quota_status': {
-        return formatResponse(searchConsoleService.getQuotaStatus());
-      }
+server.registerTool('coverage_report', {
+  description: 'Cross-reference sitemap URLs with search analytics to find unindexed pages and orphaned URLs not in sitemap',
+  inputSchema: CoverageReportSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('coverage_report', () =>
+  searchConsoleService.coverageReport(args.siteUrl, args.startDate, args.endDate)));
 
-      case 'detect_quick_wins': {
-        const parsed = QuickWinsDetectionSchema.parse(args);
-
-        // Fetch comprehensive data for analysis (25K rows with query+page dimensions)
-        const requestBody = {
-          startDate: parsed.startDate,
-          endDate: parsed.endDate,
-          dimensions: ['query', 'page'],
-          rowLimit: 25000,
-          dataState: 'final' as const,
-        };
-
-        // Single API call with quick wins detection enabled
-        const response = await searchConsoleService.enhancedSearchAnalytics(
-          parsed.siteUrl,
-          requestBody,
-          {
-            enableQuickWins: true,
-            quickWinsThresholds: {
-              minImpressions: parsed.minImpressions,
-              maxCtr: parsed.maxCtr,
-              positionRangeMin: parsed.positionRangeMin,
-              positionRangeMax: parsed.positionRangeMax,
-              targetCtr: parsed.targetCtr,
-              estimatedClickValue: parsed.estimatedClickValue,
-              conversionRate: parsed.conversionRate,
-            },
-          },
-        );
-
-        // Return focused quick wins report
-        return formatResponse({
-          quickWins: response.data.quickWins ?? [],
-          summary: {
-            totalOpportunities: response.data.quickWins?.length ?? 0,
-            totalAdditionalClicks: response.data.quickWins?.reduce((sum, qw) => sum + qw.additionalClicks, 0) ?? 0,
-            totalEstimatedValue: response.data.quickWins?.reduce((sum, qw) => sum + qw.estimatedValue, 0) ?? 0,
-            thresholds: {
-              minImpressions: parsed.minImpressions,
-              maxCtr: parsed.maxCtr,
-              positionRange: `${parsed.positionRangeMin}-${parsed.positionRangeMax}`,
-              targetCtr: parsed.targetCtr,
-            },
-          },
-          analysisComplete: true,
-        });
-      }
-
-      // --------------------------------------------------------------------
-      // URL Inspection
-      // --------------------------------------------------------------------
-      case 'index_inspect': {
-        const parsed = IndexInspectSchema.parse(args);
-        const response = await searchConsoleService.indexInspect({
-          siteUrl: parsed.siteUrl,
-          inspectionUrl: parsed.inspectionUrl,
-          languageCode: parsed.languageCode,
-        });
-        return formatResponse(response.data);
-      }
-
-      // --------------------------------------------------------------------
-      // Sitemaps
-      // --------------------------------------------------------------------
-      case 'list_sitemaps': {
-        const parsed = ListSitemapsSchema.parse(args);
-        const response = await searchConsoleService.listSitemaps({
-          siteUrl: parsed.siteUrl,
-          sitemapIndex: parsed.sitemapIndex,
-        });
-        return formatResponse(response.data);
-      }
-
-      case 'get_sitemap': {
-        const parsed = GetSitemapSchema.parse(args);
-        const response = await searchConsoleService.getSitemap({
-          siteUrl: parsed.siteUrl,
-          feedpath: parsed.feedpath,
-        });
-        return formatResponse(response.data);
-      }
-
-      case 'submit_sitemap': {
-        const parsed = SubmitSitemapSchema.parse(args);
-        const response = await searchConsoleService.submitSitemap({
-          siteUrl: parsed.siteUrl,
-          feedpath: parsed.feedpath,
-        });
-        return formatResponse({
-          success: true,
-          message: `Sitemap ${parsed.feedpath} submitted successfully`,
-          data: response.data,
-        });
-      }
-
-      case 'delete_sitemap': {
-        const parsed = DeleteSitemapSchema.parse(args);
-        const response = await searchConsoleService.deleteSitemap({
-          siteUrl: parsed.siteUrl,
-          feedpath: parsed.feedpath,
-        });
-        return formatResponse({
-          success: true,
-          message: `Sitemap ${parsed.feedpath} deleted successfully`,
-          data: response.data,
-        });
-      }
-
-      // --------------------------------------------------------------------
-      // Batch Inspect
-      // --------------------------------------------------------------------
-      case 'batch_inspect': {
-        const parsed = BatchInspectSchema.parse(args);
-        const response = await searchConsoleService.batchInspect(
-          parsed.siteUrl,
-          parsed.urls,
-          parsed.maxUrls,
-          parsed.languageCode,
-        );
-        return formatResponse(response);
-      }
-
-      // --------------------------------------------------------------------
-      // Coverage Report
-      // --------------------------------------------------------------------
-      case 'coverage_report': {
-        const parsed = CoverageReportSchema.parse(args);
-        const response = await searchConsoleService.coverageReport(
-          parsed.siteUrl,
-          parsed.startDate,
-          parsed.endDate,
-        );
-        return formatResponse(response);
-      }
-
-      // --------------------------------------------------------------------
-      // Rich Results Check
-      // --------------------------------------------------------------------
-      case 'rich_results_check': {
-        const parsed = RichResultsCheckSchema.parse(args);
-        const response = await searchConsoleService.richResultsCheck(
-          parsed.siteUrl,
-          parsed.urls,
-          parsed.maxUrls,
-          parsed.languageCode,
-        );
-        return formatResponse(response);
-      }
-
-      // --------------------------------------------------------------------
-      // Unknown Tool
-      // --------------------------------------------------------------------
-      default:
-        throw new Error(`Unknown tool: ${toolName}`);
-    }
-  } catch (error) {
-    // Sanitize error message before logging
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const sanitized = sanitizeForLogging(errorMessage);
-    
-    // Send to MCP logging channel
-    await server.sendLoggingMessage({
-      level: 'error',
-      data: `[${toolName}] ${sanitized}`,
-    });
-
-    // Handle Zod validation errors with detailed messages
-    if (error instanceof z.ZodError) {
-      const issues = error.issues.map(issue => {
-        const path = issue.path.length > 0 ? issue.path.join('.') : 'input';
-        return `${path}: ${issue.message}`;
-      });
-      throw new Error(`Invalid arguments for ${toolName}: ${issues.join('; ')}`);
-    }
-
-    // Re-throw other errors (already sanitized)
-    if (error instanceof Error) {
-      error.message = sanitized;
-    }
-    throw error;
-  }
-});
+server.registerTool('rich_results_check', {
+  description: 'Inspect URLs for rich results (structured data) issues and detected item types',
+  inputSchema: RichResultsCheckSchema,
+  annotations: READ_ONLY,
+}, (args) => respond('rich_results_check', () =>
+  searchConsoleService.richResultsCheck(args.siteUrl, args.urls, args.maxUrls, args.languageCode)));
 
 // ============================================================================
 // Server Startup

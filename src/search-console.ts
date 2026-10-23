@@ -1,6 +1,5 @@
 import { gunzipSync } from 'node:zlib';
-import { google, searchconsole_v1 } from 'googleapis';
-import { GoogleAuth, AuthClient } from 'google-auth-library';
+import { auth, searchconsole, searchconsole_v1 } from '@googleapis/searchconsole';
 import { QuickWinsThresholds } from './schemas.js';
 import { validateDateRange, validateHourlyRange, validateSiteUrl, validateRegex, validateArrayLength, parseGoogleApiError } from './validators.js';
 import { QuotaTracker } from './quota-tracker.js';
@@ -107,6 +106,32 @@ type SubmitSitemapRequest = searchconsole_v1.Params$Resource$Sitemaps$Submit;
 type DeleteSitemapRequest = searchconsole_v1.Params$Resource$Sitemaps$Delete;
 type IndexInspectRequest = searchconsole_v1.Params$Resource$Urlinspection$Index$Inspect['requestBody'];
 
+/**
+ * Retry settings for the API client. The library already retries 408/429/5xx and
+ * network failures with exponential backoff (3 tries), but only for GET/HEAD/PUT/
+ * OPTIONS/DELETE. searchanalytics.query and urlInspection.index.inspect are POSTs
+ * that only read, so they are safe to retry too.
+ */
+export const RETRY_CONFIG = {
+  httpMethodsToRetry: ['GET', 'HEAD', 'PUT', 'OPTIONS', 'DELETE', 'POST'],
+};
+
+/** Result of cannibalization detection */
+export interface CannibalizationResult {
+  /** Queries where two or more pages each hold at least minShare of the impressions */
+  candidates: Array<{
+    query: string;
+    impressions: number;
+    clicks: number;
+    pages: Array<{ page: string; impressions: number; clicks: number; position: number; share: number }>;
+  }>;
+  totalCandidates: number;
+  queriesAnalyzed: number;
+  rowsFetched: number;
+  /** Present when the API row cap was hit, so long-tail queries are missing */
+  warning?: string;
+}
+
 // ============================================================================
 // Service Class
 // ============================================================================
@@ -115,7 +140,7 @@ type IndexInspectRequest = searchconsole_v1.Params$Resource$Urlinspection$Index$
  * Service for interacting with Google Search Console API
  *
  * Features:
- * - Caches auth client for performance
+ * - One API client; GoogleAuth loads the key file on first use and caches the credential
  * - Supports both readonly and write operations
  * - Automatic URL normalization with fallback
  * - Quick wins detection algorithm
@@ -123,8 +148,7 @@ type IndexInspectRequest = searchconsole_v1.Params$Resource$Urlinspection$Index$
  * @see https://developers.google.com/webmaster-tools/v1/api_reference_index
  */
 export class SearchConsoleService {
-  private auth: GoogleAuth;
-  private cachedAuthClient: AuthClient | null = null;
+  private readonly client: searchconsole_v1.Searchconsole;
   private readonly hasWriteAccess: boolean;
   private quotaTracker: QuotaTracker;
 
@@ -144,20 +168,11 @@ export class SearchConsoleService {
       ? ['https://www.googleapis.com/auth/webmasters']
       : ['https://www.googleapis.com/auth/webmasters.readonly'];
 
-    this.auth = new google.auth.GoogleAuth({
-      keyFile: credentials,
-      scopes,
+    this.client = searchconsole({
+      version: 'v1',
+      auth: new auth.GoogleAuth({ keyFile: credentials, scopes }),
+      retryConfig: RETRY_CONFIG,
     });
-  }
-
-  /**
-   * Gets cached auth client or creates new one
-   */
-  private async getAuthClient(): Promise<AuthClient> {
-    if (!this.cachedAuthClient) {
-      this.cachedAuthClient = await this.auth.getClient() as AuthClient;
-    }
-    return this.cachedAuthClient;
   }
 
   /**
@@ -166,14 +181,10 @@ export class SearchConsoleService {
    * v1 (`searchconsole`) is the canonical namespace and a superset: it exposes
    * searchanalytics, sitemaps, sites, and urlInspection — so a single client
    * covers every call this service makes (the legacy `webmasters` v3 namespace
-   * is no longer needed).
+   * is no longer needed). Async so tests can stub it.
    */
   private async getClient(): Promise<searchconsole_v1.Searchconsole> {
-    const authClient = await this.getAuthClient();
-    return google.searchconsole({
-      version: 'v1',
-      auth: authClient,
-    } as searchconsole_v1.Options);
+    return this.client;
   }
 
   /**
@@ -200,8 +211,10 @@ export class SearchConsoleService {
    * URL on permission errors, and converts any failure into an actionable error
    * via parseGoogleApiError. This is the single error-handling path for every
    * API call in this service, so callers do not need their own try/catch.
+   * Skips the retry when the siteUrl is already in normalized form.
    */
   private async withPermissionFallback<T>(
+    siteUrl: string,
     operation: () => Promise<T>,
     fallbackOperation: () => Promise<T>,
     context: string,
@@ -211,7 +224,8 @@ export class SearchConsoleService {
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message.toLowerCase() : '';
 
-      if (errorMessage.includes('permission') || errorMessage.includes('403')) {
+      const permissionError = errorMessage.includes('permission') || errorMessage.includes('403');
+      if (permissionError && this.normalizeUrl(siteUrl) !== siteUrl) {
         console.error(`[GSC] Permission error in ${context}, trying normalized URL...`);
         try {
           return await fallbackOperation();
@@ -242,6 +256,13 @@ export class SearchConsoleService {
       }
     }
 
+    // Google silently matches nothing on an invalid RE2 pattern, so check them here.
+    for (const group of requestBody?.dimensionFilterGroups ?? []) {
+      for (const f of group.filters ?? []) {
+        if (f.operator === 'includingRegex' || f.operator === 'excludingRegex') validateRegex(f.expression ?? '');
+      }
+    }
+
     const quotaWarning = this.quotaTracker.recordSearchAnalytics();
     if (quotaWarning) {
       console.error(quotaWarning);
@@ -250,6 +271,7 @@ export class SearchConsoleService {
     const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
+      siteUrl,
       () => webmasters.searchanalytics.query({ siteUrl, requestBody }),
       () => webmasters.searchanalytics.query({
         siteUrl: this.normalizeUrl(siteUrl),
@@ -466,16 +488,11 @@ export class SearchConsoleService {
       throw new Error('Request body is required');
     }
 
-    // Validate regex if provided
-    if (options.regexFilter) {
-      validateRegex(options.regexFilter);
-    }
-
     // Clone request body to avoid mutation
     const enhancedRequestBody = { ...requestBody };
 
-    // Apply regex filter if provided and query dimension is included
-    if (options.regexFilter && enhancedRequestBody.dimensions?.includes('query')) {
+    // Apply the regex filter; the API filters on query even when not grouping by it.
+    if (options.regexFilter) {
       enhancedRequestBody.dimensionFilterGroups = [
         ...(enhancedRequestBody.dimensionFilterGroups || []),
         {
@@ -621,6 +638,62 @@ export class SearchConsoleService {
       : 'Review content for optimization opportunities';
   }
 
+  /**
+   * Finds keyword cannibalization: queries where two or more of the site's pages
+   * each hold at least `minShare` of the query's impressions, so they compete for
+   * the same searches. One query+page request (the caller sets the dimensions and
+   * rowLimit). Shares are of the query's page-level impressions, since grouping
+   * by page counts impressions per page rather than per property.
+   */
+  async detectCannibalization(
+    siteUrl: string,
+    requestBody: SearchAnalyticsQueryRequest,
+    options: { minImpressions: number; minShare: number; topN: number },
+  ): Promise<CannibalizationResult> {
+    const resp = await this.searchAnalytics(siteUrl, requestBody);
+    const rows = (resp.data.rows || []) as SearchAnalyticsRow[];
+
+    const byQuery = new Map<string, SearchAnalyticsRow[]>();
+    for (const row of rows) {
+      const query = row.keys?.[0];
+      if (query === undefined) continue;
+      const list = byQuery.get(query);
+      if (list) list.push(row); else byQuery.set(query, [row]);
+    }
+
+    const candidates: CannibalizationResult['candidates'] = [];
+    for (const [query, queryRows] of byQuery) {
+      if (queryRows.length < 2) continue;
+      const impressions = queryRows.reduce((sum, r) => sum + (r.impressions ?? 0), 0);
+      if (impressions < options.minImpressions) continue;
+      const pages = queryRows
+        .map(r => ({
+          page: r.keys?.[1] ?? 'N/A',
+          impressions: r.impressions ?? 0,
+          clicks: r.clicks ?? 0,
+          position: Number((r.position ?? 0).toFixed(1)),
+          share: Number(((r.impressions ?? 0) / impressions).toFixed(3)),
+        }))
+        .filter(p => p.share >= options.minShare)
+        .sort((a, b) => b.impressions - a.impressions);
+      if (pages.length < 2) continue;
+      const clicks = queryRows.reduce((sum, r) => sum + (r.clicks ?? 0), 0);
+      candidates.push({ query, impressions, clicks, pages });
+    }
+    candidates.sort((a, b) => b.impressions - a.impressions);
+
+    const rowLimit = requestBody?.rowLimit ?? 1000;
+    return {
+      candidates: candidates.slice(0, options.topN),
+      totalCandidates: candidates.length,
+      queriesAnalyzed: byQuery.size,
+      rowsFetched: rows.length,
+      ...(rows.length >= rowLimit
+        ? { warning: `Hit the ${rowLimit}-row cap, so lower-volume queries are missing. Narrow the date range or add filters (e.g. a page section) to cover them.` }
+        : {}),
+    };
+  }
+
   // ==========================================================================
   // Sites
   // ==========================================================================
@@ -630,7 +703,12 @@ export class SearchConsoleService {
    */
   async listSites() {
     const webmasters = await this.getClient();
-    return webmasters.sites.list();
+    // No siteUrl, so no sc-domain fallback; still route failures through the shared guidance.
+    try {
+      return await webmasters.sites.list();
+    } catch (err) {
+      throw parseGoogleApiError(err);
+    }
   }
 
   // ==========================================================================
@@ -644,6 +722,7 @@ export class SearchConsoleService {
     const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
+      request.siteUrl!,
       () => webmasters.sitemaps.list(request),
       () => webmasters.sitemaps.list({
         ...request,
@@ -660,6 +739,7 @@ export class SearchConsoleService {
     const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
+      request.siteUrl!,
       () => webmasters.sitemaps.get(request),
       () => webmasters.sitemaps.get({
         ...request,
@@ -682,6 +762,7 @@ export class SearchConsoleService {
     const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
+      request.siteUrl!,
       () => webmasters.sitemaps.submit(request),
       () => webmasters.sitemaps.submit({
         ...request,
@@ -704,6 +785,7 @@ export class SearchConsoleService {
     const webmasters = await this.getClient();
 
     return this.withPermissionFallback(
+      request.siteUrl!,
       () => webmasters.sitemaps.delete(request),
       () => webmasters.sitemaps.delete({
         ...request,
@@ -737,6 +819,7 @@ export class SearchConsoleService {
     // Retry with the normalized sc-domain siteUrl on a permission error, matching
     // searchAnalytics (a URL-prefix siteUrl against a domain property would fail).
     return this.withPermissionFallback(
+      requestBody!.siteUrl!,
       () => searchConsole.urlInspection.index.inspect({ requestBody }),
       () => searchConsole.urlInspection.index.inspect({
         requestBody: { ...requestBody, siteUrl: this.normalizeUrl(requestBody!.siteUrl!) },
@@ -854,51 +937,73 @@ export class SearchConsoleService {
     }
 
     const urlsToInspect = urls.slice(0, maxUrls);
-    const pass: Array<{ url: string; lastCrawlTime?: string | null }> = [];
-    const fail: Array<{
-      url: string; coverageState?: string | null; pageFetchState?: string | null;
-      robotsTxtState?: string | null; indexingState?: string | null;
-      lastCrawlTime?: string | null; googleCanonical?: string | null; userCanonical?: string | null;
-    }> = [];
-    const partial: Array<{ url: string; coverageState?: string | null; pageFetchState?: string | null; lastCrawlTime?: string | null }> = [];
-    const neutral: Array<{ url: string; coverageState?: string | null }> = [];
-    const errors: Array<{ url: string; error: string }> = [];
+    type Idx = searchconsole_v1.Schema$IndexStatusInspectionResult;
+    const pass: Array<{ url: string; lastCrawlTime?: string | null; crawledAs?: string | null; inspectionResultLink?: string | null }> = [];
+    const fail: Array<Pick<Idx, 'coverageState' | 'pageFetchState' | 'robotsTxtState' | 'indexingState' | 'lastCrawlTime'
+      | 'crawledAs' | 'googleCanonical' | 'userCanonical' | 'sitemap' | 'referringUrls'> & { url: string; inspectionResultLink?: string | null }> = [];
+    const partial: Array<Pick<Idx, 'coverageState' | 'pageFetchState' | 'lastCrawlTime' | 'crawledAs'> & { url: string; inspectionResultLink?: string | null }> = [];
+    const neutral: Array<{ url: string; coverageState?: string | null; inspectionResultLink?: string | null }> = [];
 
-    for (const url of urlsToInspect) {
-      try {
-        const resp = await this.indexInspect({ siteUrl, inspectionUrl: url, languageCode });
-        const idx = resp.data?.inspectionResult?.indexStatusResult;
-        const verdict = idx?.verdict ?? 'VERDICT_UNSPECIFIED';
-
-        if (verdict === 'PASS') {
-          pass.push({ url, lastCrawlTime: idx?.lastCrawlTime });
-        } else if (verdict === 'FAIL') {
-          fail.push({
-            url, coverageState: idx?.coverageState, pageFetchState: idx?.pageFetchState,
-            robotsTxtState: idx?.robotsTxtState, indexingState: idx?.indexingState,
-            lastCrawlTime: idx?.lastCrawlTime, googleCanonical: idx?.googleCanonical,
-            userCanonical: idx?.userCanonical,
-          });
-        } else if (verdict === 'PARTIAL') {
-          partial.push({ url, coverageState: idx?.coverageState, pageFetchState: idx?.pageFetchState, lastCrawlTime: idx?.lastCrawlTime });
-        } else {
-          neutral.push({ url, coverageState: idx?.coverageState });
-        }
-        
-        // Use adaptive delay based on quota tracker
-        const delay = this.quotaTracker.getRecommendedInspectionDelay();
-        await new Promise(r => setTimeout(r, delay));
-      } catch (err) {
-        errors.push({ url, error: err instanceof Error ? err.message : String(err) });
+    const run = await this.inspectEach(siteUrl, urlsToInspect, languageCode, (url, result) => {
+      const idx = result?.indexStatusResult;
+      const link = result?.inspectionResultLink;
+      const verdict = idx?.verdict ?? 'VERDICT_UNSPECIFIED';
+      if (verdict === 'PASS') {
+        pass.push({ url, lastCrawlTime: idx?.lastCrawlTime, crawledAs: idx?.crawledAs, inspectionResultLink: link });
+      } else if (verdict === 'FAIL') {
+        fail.push({
+          url, coverageState: idx?.coverageState, pageFetchState: idx?.pageFetchState,
+          robotsTxtState: idx?.robotsTxtState, indexingState: idx?.indexingState,
+          lastCrawlTime: idx?.lastCrawlTime, crawledAs: idx?.crawledAs, googleCanonical: idx?.googleCanonical,
+          userCanonical: idx?.userCanonical, sitemap: idx?.sitemap, referringUrls: idx?.referringUrls,
+          inspectionResultLink: link,
+        });
+      } else if (verdict === 'PARTIAL') {
+        partial.push({ url, coverageState: idx?.coverageState, pageFetchState: idx?.pageFetchState, lastCrawlTime: idx?.lastCrawlTime, crawledAs: idx?.crawledAs, inspectionResultLink: link });
+      } else {
+        neutral.push({ url, coverageState: idx?.coverageState, inspectionResultLink: link });
       }
-    }
+    });
 
     return {
-      summary: { pass: pass.length, fail: fail.length, partial: partial.length, neutral: neutral.length, errors: errors.length },
-      results: { pass, fail, partial, neutral, errors },
-      totalInspected: urlsToInspect.length,
+      summary: { pass: pass.length, fail: fail.length, partial: partial.length, neutral: neutral.length, errors: run.errors.length },
+      results: { pass, fail, partial, neutral, errors: run.errors },
+      totalInspected: run.attempted,
+      ...(run.stoppedEarly ? { stoppedEarly: run.stoppedEarly } : {}),
       ...(sitemapUrlCount !== undefined ? { sitemapUrlCount } : {}),
     };
+  }
+
+  /**
+   * Inspects URLs one at a time, pacing calls by the quota tracker. A failed URL is
+   * recorded and skipped; a quota error (429, already retried with backoff by the
+   * client) stops the run, because the remaining URLs would only fail the same way.
+   */
+  private async inspectEach(
+    siteUrl: string,
+    urls: string[],
+    languageCode: string,
+    onResult: (url: string, result: searchconsole_v1.Schema$UrlInspectionResult | undefined) => void,
+  ): Promise<{ attempted: number; errors: Array<{ url: string; error: string }>; stoppedEarly?: { reason: string; notInspected: number } }> {
+    const errors: Array<{ url: string; error: string }> = [];
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      try {
+        const resp = await this.indexInspect({ siteUrl, inspectionUrl: url, languageCode });
+        onResult(url, resp.data?.inspectionResult);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        errors.push({ url, error });
+        if ((err as { code?: number })?.code === 429) {
+          return { attempted: i + 1, errors, stoppedEarly: { reason: error, notInspected: urls.length - i - 1 } };
+        }
+      }
+      // Use adaptive delay based on quota tracker
+      if (i < urls.length - 1) {
+        await new Promise(r => setTimeout(r, this.quotaTracker.getRecommendedInspectionDelay()));
+      }
+    }
+    return { attempted: urls.length, errors };
   }
 
   // ==========================================================================
@@ -984,33 +1089,36 @@ export class SearchConsoleService {
     const results: Array<{
       url: string;
       verdict?: string | null;
+      inspectionResultLink?: string | null;
       detectedItems: Array<{ type: string; items: Array<{ name?: string | null; issues?: Array<{ issueMessage?: string | null; severity?: string | null }> }> }>;
     }> = [];
     const issuesSummary: Record<string, number> = {};
 
-    for (const url of urlsToCheck) {
-      try {
-        const resp = await this.indexInspect({ siteUrl, inspectionUrl: url, languageCode });
-        const rich = resp.data?.inspectionResult?.richResultsResult;
-        if (rich?.detectedItems && rich.detectedItems.length > 0) {
-          const detectedItems = rich.detectedItems.map(di => ({
-            type: di.richResultType ?? 'unknown',
-            items: (di.items ?? []).map(item => {
-              const issues = (item.issues ?? []).map(issue => {
-                if (issue.issueMessage) issuesSummary[issue.issueMessage] = (issuesSummary[issue.issueMessage] ?? 0) + 1;
-                return { issueMessage: issue.issueMessage, severity: issue.severity };
-              });
-              return { name: item.name, ...(issues.length > 0 ? { issues } : {}) };
-            }),
-          }));
-          results.push({ url, verdict: rich.verdict, detectedItems });
-        }
-        // Use adaptive delay based on quota tracker
-        const delay = this.quotaTracker.getRecommendedInspectionDelay();
-        await new Promise(r => setTimeout(r, delay));
-      } catch { /* skip */ }
-    }
+    const run = await this.inspectEach(siteUrl, urlsToCheck, languageCode, (url, result) => {
+      const rich = result?.richResultsResult;
+      if (rich?.detectedItems && rich.detectedItems.length > 0) {
+        const detectedItems = rich.detectedItems.map(di => ({
+          type: di.richResultType ?? 'unknown',
+          items: (di.items ?? []).map(item => {
+            const issues = (item.issues ?? []).map(issue => {
+              if (issue.issueMessage) issuesSummary[issue.issueMessage] = (issuesSummary[issue.issueMessage] ?? 0) + 1;
+              return { issueMessage: issue.issueMessage, severity: issue.severity };
+            });
+            return { name: item.name, ...(issues.length > 0 ? { issues } : {}) };
+          }),
+        }));
+        results.push({ url, verdict: rich.verdict, inspectionResultLink: result?.inspectionResultLink, detectedItems });
+      }
+    });
 
-    return { totalChecked: urlsToCheck.length, urlsWithRichResults: results.length, results, issuesSummary };
+    // Failed URLs are reported, not dropped: a URL that errored is not a URL without rich results.
+    return {
+      totalChecked: run.attempted,
+      urlsWithRichResults: results.length,
+      results,
+      issuesSummary,
+      errors: run.errors,
+      ...(run.stoppedEarly ? { stoppedEarly: run.stoppedEarly } : {}),
+    };
   }
 }

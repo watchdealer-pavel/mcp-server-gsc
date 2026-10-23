@@ -14,7 +14,7 @@
 
 ## What it does
 
-Gives your AI agent direct access to Google Search Console through 15 tools:
+Gives your AI agent direct access to Google Search Console through 16 tools:
 
 | Tool | What it does |
 |------|-------------|
@@ -24,8 +24,9 @@ Gives your AI agent direct access to Google Search Console through 15 tools:
 | `enhanced_search_analytics` | Regex filtering plus automatic quick-wins detection |
 | `compare_periods` | Diff two date ranges: totals, deltas, and the queries that moved most |
 | `detect_quick_wins` | Find high-impression, low-CTR keywords with revenue estimates |
+| `detect_cannibalization` | Find queries where several of your pages compete for the same searches |
 | `index_inspect` | Check the indexing status of a single URL |
-| `batch_inspect` | Inspect many URLs at once, grouped by verdict (PASS/FAIL/PARTIAL) |
+| `batch_inspect` | Inspect many URLs at once, grouped by verdict (PASS/FAIL/PARTIAL), with a link to each URL's report in Search Console |
 | `coverage_report` | Cross-reference sitemap URLs against analytics to find orphaned pages |
 | `rich_results_check` | Audit structured data (Product, FAQ, Review snippets) |
 | `list_sitemaps` | List submitted sitemaps |
@@ -36,11 +37,15 @@ Gives your AI agent direct access to Google Search Console through 15 tools:
 
 **Hourly data.** `search_analytics` supports Google's hourly export. Pass `dimensions: "hour"` with `dataState: "hourly_all"` and a range of 10 days or less to get hour-by-hour clicks and impressions.
 
-Every tool validates its input (date ranges, siteUrl format, the 16-month window) and coerces numeric parameters for you. The server also tracks API quota per site and warns before you run into the limits.
+Every tool validates its input (date ranges, siteUrl format, the 16-month window), rejects unknown or misspelled arguments, and coerces numeric parameters for you. The server also tracks API quota per site and warns before you run into the limits.
+
+Tools carry MCP annotations: everything except `submit_sitemap` and `delete_sitemap` is marked read-only, and `delete_sitemap` is marked destructive, so clients that support annotations can auto-approve reads and ask before a delete.
 
 ---
 
 ## Install
+
+Requires Node.js 24 or later.
 
 ```bash
 git clone https://github.com/watchdealer-pavel/mcp-server-gsc.git
@@ -159,6 +164,43 @@ Each period also reports `dataThrough`, the last date that has data. Totals are 
 
 Quiet days come back as zero-impression rows rather than missing rows, so a low-traffic filter doesn't trigger a false warning. With `dataState: "hourly_all"`, totals are grouped by hour, the only grouping the API accepts for it.
 
+### Filter by several conditions
+
+The analytics tools (`search_analytics`, `search_analytics_all`, `enhanced_search_analytics`, `compare_periods`, `detect_cannibalization`) take a `filters` array. Every filter must match, and each has its own operator: `equals`, `notEquals`, `contains`, `notContains`, `includingRegex` or `excludingRegex` (RE2 syntax). It works on `query`, `page`, `country`, `device` and `searchAppearance`, and combines with the shorthand `pageFilter`/`queryFilter`/`countryFilter`/`deviceFilter` parameters.
+
+Non-branded traffic to the blog, for example:
+
+```
+Tool: search_analytics
+  siteUrl: "sc-domain:example.com"
+  startDate: "2026-01-01"
+  endDate: "2026-03-20"
+  dimensions: "query"
+  filters: [
+    { dimension: "page",  operator: "contains",       expression: "/blog/" },
+    { dimension: "query", operator: "excludingRegex", expression: "acme|acmecorp" }
+  ]
+```
+
+Regex patterns use RE2, Google's dialect: no lookarounds or backreferences, and `(?i)` makes a pattern case-insensitive. The server checks every pattern before sending it, because Google answers an invalid one with zero rows instead of an error.
+
+Search Console's branded-query split exists only in its web interface, not in the API. An `excludingRegex` (or `includingRegex`) on your brand terms gives you the same split.
+
+### Find keyword cannibalization
+
+Find queries where two or more of your pages each get a meaningful share of the impressions, so they compete with each other:
+
+```
+Tool: detect_cannibalization
+  siteUrl: "sc-domain:example.com"
+  startDate: "2026-01-01"
+  endDate: "2026-03-20"
+  minImpressions: 50
+  minShare: 0.1
+```
+
+Returns each such query with its competing pages (impressions, clicks, position, and share of the query's impressions), largest first. A page counts when it has at least `minShare` of the impressions (default 10%). It takes one API call of up to 25,000 query+page rows. If that cap is hit, the response says so, and you can narrow the date range or add `filters` to cover the rest.
+
 ### Search analytics with regex
 
 Filter queries by pattern, useful for topic-specific analysis:
@@ -170,9 +212,11 @@ Tool: enhanced_search_analytics
   endDate: "2026-03-20"
   dimensions: "query,page"
   rowLimit: 500
-  regexFilter: "buy|price|review"
+  regexFilter: "(?i)buy|price|review"
   enableQuickWins: true
 ```
+
+`regexFilter` matches queries (RE2 syntax) and applies even when you don't group by query.
 
 ### Pull more than 25,000 rows
 
@@ -208,6 +252,8 @@ Tool: rich_results_check
   maxUrls: 20
 ```
 
+URLs that fail to inspect are listed under `errors`, so a failure never reads as "no rich results".
+
 ---
 
 ## Good to know
@@ -220,7 +266,9 @@ Tool: rich_results_check
 
 **Date ranges.** Up to 16 months, formatted `YYYY-MM-DD`.
 
-**Quota.** Google's per-site limits are 1,200 queries per minute for Search Analytics, and 600 per minute plus 2,000 per day for URL Inspection. The server tracks usage, warns at 80%, throttles batch inspections automatically, and reports what it sees through `get_quota_status`.
+**Quota.** Google's per-site limits are 1,200 queries per minute for Search Analytics, and 600 per minute plus 2,000 per day for URL Inspection. The server tracks usage, warns at 80%, throttles batch inspections automatically, and reports what it sees through `get_quota_status`. If `batch_inspect` or `rich_results_check` still hits a quota error, it stops, returns what it has done, and reports how many URLs it skipped under `stoppedEarly`.
+
+**Retries.** Transient failures (rate limits, Google 5xx errors, network drops) are retried up to three times with exponential backoff before a tool reports an error.
 
 ---
 
@@ -238,7 +286,7 @@ Tool: rich_results_check
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE); it keeps the original author's copyright notice.
 
 ---
 

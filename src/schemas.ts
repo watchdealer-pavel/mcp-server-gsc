@@ -54,6 +54,11 @@ export const VALID_FILTER_OPERATORS = [
 ] as const;
 
 /**
+ * Dimensions a filter can target (every dimension except date and hour)
+ */
+export const VALID_FILTER_DIMENSIONS = ['query', 'page', 'country', 'device', 'searchAppearance'] as const;
+
+/**
  * Valid device types
  */
 export const VALID_DEVICE_TYPES = ['DESKTOP', 'MOBILE', 'TABLET'] as const;
@@ -85,7 +90,7 @@ const validateDimensions = (val: string): boolean => {
 // Base Schemas
 // ============================================================================
 
-export const GSCBaseSchema = z.object({
+export const GSCBaseSchema = z.strictObject({
   siteUrl: z
     .string()
     .min(1)
@@ -123,7 +128,7 @@ export const SearchAnalyticsSchema = GSCBaseSchema.extend({
   aggregationType: z
     .enum(VALID_AGGREGATION_TYPES)
     .optional()
-    .describe('How to aggregate results'),
+    .describe('How to aggregate results. byProperty cannot be combined with the page dimension or a page filter; byNewsShowcasePanel requires type "discover" or "googleNews" with searchAppearanceFilter "NEWS_SHOWCASE"'),
   rowLimit: z
     .coerce.number()
     .int()
@@ -166,13 +171,21 @@ export const SearchAnalyticsSchema = GSCBaseSchema.extend({
     .enum(VALID_FILTER_OPERATORS)
     .default('equals')
     .describe('Operator for page/query filters'),
+  filters: z
+    .array(z.strictObject({
+      dimension: z.enum(VALID_FILTER_DIMENSIONS),
+      operator: z.enum(VALID_FILTER_OPERATORS).default('equals'),
+      expression: z.string().min(1),
+    }))
+    .optional()
+    .describe('Additional filters, all of which must match (AND), each with its own operator. Combine with the shorthand filters above. Example: [{"dimension":"page","operator":"contains","expression":"/blog/"},{"dimension":"query","operator":"excludingRegex","expression":"acme|acmecorp"}] keeps blog pages and drops branded queries. Regex operators use RE2 syntax (no lookarounds or backreferences; "(?i)" makes a pattern case-insensitive); equals/notEquals are case-sensitive for page and query.'),
 });
 
 // ============================================================================
 // Quick Wins Detection Schemas
 // ============================================================================
 
-export const QuickWinsThresholdsSchema = z.object({
+export const QuickWinsThresholdsSchema = z.strictObject({
   minImpressions: z
     .coerce.number()
     .int()
@@ -225,7 +238,7 @@ export const QuickWinsDetectionSchema = GSCBaseSchema.extend({
     .string()
     .regex(DATE_REGEX, 'Must be in YYYY-MM-DD format')
     .describe('End date in YYYY-MM-DD format'),
-}).merge(QuickWinsThresholdsSchema);
+}).extend(QuickWinsThresholdsSchema.shape);
 
 // ============================================================================
 // Pagination Schema (fetch beyond the 25k-per-request cap)
@@ -272,7 +285,7 @@ export const EnhancedSearchAnalyticsSchema = SearchAnalyticsSchema.extend({
   regexFilter: z
     .string()
     .optional()
-    .describe('Additional regex filter for query dimension'),
+    .describe('RE2 regex the query must match, e.g. "(?i)buy|price" (case-insensitive). Applied even when not grouping by query'),
   enableQuickWins: z
     .boolean()
     .default(false)
@@ -282,12 +295,50 @@ export const EnhancedSearchAnalyticsSchema = SearchAnalyticsSchema.extend({
 });
 
 // ============================================================================
+// Cannibalization Detection Schema
+// ============================================================================
+
+export const CannibalizationSchema = SearchAnalyticsSchema.pick({
+  siteUrl: true,
+  startDate: true,
+  endDate: true,
+  type: true,
+  dataState: true,
+  pageFilter: true,
+  queryFilter: true,
+  countryFilter: true,
+  deviceFilter: true,
+  searchAppearanceFilter: true,
+  filterOperator: true,
+  filters: true,
+}).extend({
+  minImpressions: z
+    .coerce.number()
+    .int()
+    .min(1)
+    .default(50)
+    .describe('Minimum total impressions for a query to be considered'),
+  minShare: z
+    .coerce.number()
+    .min(0.01)
+    .max(0.5)
+    .default(0.1)
+    .describe('Minimum share (0.01-0.5) of a query\'s impressions a page needs to count as competing (default 0.1 = 10%)'),
+  topN: z
+    .coerce.number()
+    .int()
+    .min(1)
+    .max(500)
+    .default(50)
+    .describe('How many cannibalized queries to return, largest by impressions first'),
+});
+
+// ============================================================================
 // URL Inspection Schema
 // ============================================================================
 
 export const IndexInspectSchema = GSCBaseSchema.extend({
   inspectionUrl: z
-    .string()
     .url('Must be a valid URL')
     .describe('The fully-qualified URL to inspect'),
   languageCode: z
@@ -301,47 +352,43 @@ export const IndexInspectSchema = GSCBaseSchema.extend({
 // Sitemap Schemas
 // ============================================================================
 
-export const ListSitemapsSchema = z.object({
+export const ListSitemapsSchema = z.strictObject({
   siteUrl: z
     .string()
     .min(1)
     .describe("The site's URL, including protocol (e.g., https://www.example.com/)"),
   sitemapIndex: z
-    .string()
     .url()
     .optional()
     .describe("Optional sitemap index URL to filter results"),
 });
 
-export const GetSitemapSchema = z.object({
+export const GetSitemapSchema = z.strictObject({
   siteUrl: z
     .string()
     .min(1)
     .describe("The site's URL, including protocol"),
   feedpath: z
-    .string()
     .url('Must be a valid URL')
     .describe('The URL of the sitemap to retrieve'),
 });
 
-export const SubmitSitemapSchema = z.object({
+export const SubmitSitemapSchema = z.strictObject({
   siteUrl: z
     .string()
     .min(1)
     .describe("The site's URL, including protocol"),
   feedpath: z
-    .string()
     .url('Must be a valid URL')
     .describe('The URL of the sitemap to submit'),
 });
 
-export const DeleteSitemapSchema = z.object({
+export const DeleteSitemapSchema = z.strictObject({
   siteUrl: z
     .string()
     .min(1)
     .describe("The site's URL, including protocol"),
   feedpath: z
-    .string()
     .url('Must be a valid URL')
     .describe('The URL of the sitemap to delete'),
 });

@@ -12,12 +12,12 @@ const SERVER = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'inde
 
 const EXPECTED_TOOLS = [
   'batch_inspect', 'compare_periods', 'coverage_report', 'delete_sitemap',
-  'detect_quick_wins', 'enhanced_search_analytics', 'get_quota_status', 'get_sitemap',
-  'index_inspect', 'list_sitemaps', 'list_sites', 'rich_results_check',
+  'detect_cannibalization', 'detect_quick_wins', 'enhanced_search_analytics', 'get_quota_status',
+  'get_sitemap', 'index_inspect', 'list_sitemaps', 'list_sites', 'rich_results_check',
   'search_analytics', 'search_analytics_all', 'submit_sitemap',
 ];
 
-test('server boots on stdio and lists all 15 tools', async () => {
+test('server boots on stdio and lists all 16 tools', async () => {
   const proc = spawn(process.execPath, [SERVER], {
     env: { ...process.env, GOOGLE_APPLICATION_CREDENTIALS: '/tmp/gsc-smoke-dummy.json' },
     stdio: ['pipe', 'pipe', 'ignore'],
@@ -70,6 +70,33 @@ test('server boots on stdio and lists all 15 tools', async () => {
       ['compareEndDate', 'compareStartDate', 'endDate', 'siteUrl', 'startDate']);
     // ...while unknown (e.g. misspelled) arguments are still rejected by validating clients.
     for (const t of resp.result.tools) assert.equal(t.inputSchema.additionalProperties, false, t.name);
+    // Annotations: reads are read-only, so clients can auto-approve them; delete is flagged destructive.
+    const ann = Object.fromEntries(resp.result.tools.map((t) => [t.name, t.annotations ?? {}]));
+    for (const name of EXPECTED_TOOLS.filter((n) => !['submit_sitemap', 'delete_sitemap'].includes(n))) {
+      assert.equal(ann[name].readOnlyHint, true, name);
+    }
+    assert.equal(ann.submit_sitemap.readOnlyHint, false);
+    assert.equal(ann.submit_sitemap.destructiveHint, false);
+    assert.equal(ann.delete_sitemap.destructiveHint, true);
+
+    // Regression: the server itself rejects a misspelled argument (it used to strip it and
+    // run the query unfiltered), and reports it as a tool error the model can read.
+    send({
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'search_analytics', arguments: { siteUrl: 'sc-domain:example.com', startDate: '2026-01-01', endDate: '2026-01-02', pageFiltr: '/blog' } },
+    });
+    const bad = await waitFor((m) => m.id === 3);
+    assert.equal(bad.result.isError, true);
+    assert.match(bad.result.content[0].text, /Unrecognized key: "pageFiltr"/);
+
+    // The generic filters array only accepts filterable dimensions.
+    send({
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: { name: 'search_analytics', arguments: { siteUrl: 'sc-domain:example.com', startDate: '2026-01-01', endDate: '2026-01-02', filters: [{ dimension: 'date', expression: '2026-01-01' }] } },
+    });
+    const badFilter = await waitFor((m) => m.id === 4);
+    assert.equal(badFilter.result.isError, true);
+    assert.match(badFilter.result.content[0].text, /filters/);
   } finally {
     proc.kill();
   }

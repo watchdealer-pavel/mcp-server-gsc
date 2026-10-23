@@ -1,3 +1,5 @@
+import { RE2JS } from 're2js';
+
 /**
  * Input validation utilities for business logic and security
  */
@@ -89,11 +91,16 @@ export function validateSiteUrl(siteUrl: string): string {
 }
 
 /**
- * Validates a regex pattern for safety (prevents ReDoS)
+ * Validates a regex pattern against RE2, the dialect Search Console uses.
+ *
+ * This has to happen here: given an invalid pattern, the API does not error but
+ * silently matches nothing, so the tool would report zero traffic as fact. JS
+ * RegExp is the wrong check, as it rejects valid RE2 such as `(?i)` and accepts
+ * lookarounds and backreferences that RE2 does not support.
  */
 export function validateRegex(pattern: string): void {
   if (!pattern) return;
-  
+
   // Length limit. The pattern is forwarded to the GSC API (which enforces its
   // own limits) and is only compiled here for syntax validation, never executed
   // against input, so there is no ReDoS surface on this server to guard.
@@ -104,11 +111,13 @@ export function validateRegex(pattern: string): void {
     );
   }
 
-  // Validate it's actually valid regex
   try {
-    new RegExp(pattern);
+    RE2JS.compile(pattern);
   } catch (err) {
-    throw new Error(`Invalid regex pattern: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(
+      `Invalid regex pattern "${pattern}": ${err instanceof Error ? err.message : String(err)}. ` +
+      `Search Console uses RE2 syntax: no lookarounds or backreferences; use (?i) for case-insensitive matching.`
+    );
   }
 }
 
@@ -150,15 +159,16 @@ export function sanitizeForLogging(message: string): string {
 }
 
 /**
- * Parses Google API error and provides actionable guidance
+ * Parses Google API error and provides actionable guidance. The returned error
+ * keeps the HTTP status as `code` so callers can branch on it (e.g. stop a batch on 429).
  */
-export function parseGoogleApiError(err: any): Error {
+export function parseGoogleApiError(err: any): Error & { code?: number } {
   const message = err?.message || String(err);
-  const code = err?.code || err?.response?.status;
-  
-  // Sanitize error message
-  const sanitized = sanitizeForLogging(message);
-  
+  const code = Number(err?.code || err?.response?.status) || undefined;
+  return Object.assign(guidanceFor(code, sanitizeForLogging(message)), { code });
+}
+
+function guidanceFor(code: number | undefined, sanitized: string): Error {
   // Provide actionable guidance based on error code
   if (code === 403 || sanitized.toLowerCase().includes('permission')) {
     return new Error(
@@ -186,6 +196,7 @@ export function parseGoogleApiError(err: any): Error {
       `- siteUrl doesn't match a property (use list_sites to verify)\n` +
       `- Date range is invalid or exceeds 16 months\n` +
       `- Dimension/filter combination not supported\n` +
+      `- aggregationType not valid for the request (byProperty can't be used with page; byNewsShowcasePanel needs a NEWS_SHOWCASE filter)\n` +
       `Original error: ${sanitized}`
     );
   }
